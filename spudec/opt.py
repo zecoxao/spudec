@@ -100,6 +100,16 @@ def propagate(func):
         # the argument up, making it vanish from the listing.
         if insn.op in ABI_OPS:
             continue
+        # Never fold into a phi argument either, and for a subtler reason.
+        # The renderer has no phi nodes: it gives every member of a phi web
+        # one variable name, so the *defining instruction of each argument* is
+        # what prints as the assignment on that incoming path.  Replacing an
+        # argument with the constant it holds makes that definition dead, DCE
+        # deletes it, and the assignment disappears from the arm of the `if`
+        # that performed it -- leaving output that silently drops an
+        # assignment the machine really makes.
+        if insn.op == Op.PHI:
+            continue
         for n, s in enumerate(insn.srcs):
             if not s.is_var:
                 continue

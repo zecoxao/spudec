@@ -201,9 +201,12 @@ def _inlinable(func, call_arg_keys=()):
 
 class CGen(object):
 
-    def __init__(self, func, name_of=None, arity_of=None):
+    def __init__(self, func, name_of=None, arity_of=None, str_of=None):
         self.func = func
         self.arity_of = arity_of
+        # Resolves a constant address to a string literal; see data.py.  None
+        # disables it, which is what a database-free caller wants.
+        self.str_of = str_of or (lambda ea: None)
         # Which operands of each call are really its arguments.  Needs the
         # callee's arity: the operand list names every argument register
         # because a callee *might* read them, so without knowing how many it
@@ -252,17 +255,32 @@ class CGen(object):
             demand = getattr(func, "demand", None)
             if demand is None:
                 demand = lanes.compute_demand(func)
-            self.types, stats = types.infer(func, demand, self.namer.webs())
+            self.types, stats = types.infer(
+                func, demand, self.namer.webs(),
+                is_string=lambda val: self.str_of(val >> 96) is not None)
             stats["kinds"] = self.types.counts()
             func.types = self.types
             func.type_stats = stats
 
     # -- operands ----------------------------------------------------------
 
-    def const(self, c, scalar):
+    def const(self, c, scalar, strings=True):
+        """
+        A constant, as a string literal when its preferred slot points at one.
+
+        ``strings=False`` is for a position where a literal would be actively
+        misleading rather than helpful -- the destination of a store, where
+        `*(char *)"text" = x` reads as writing to a string constant when the
+        code is really writing into a buffer that currently holds text.
+        """
+        if strings:
+            lit = self.str_of(c.val >> 96)
+            if lit is not None:
+                return lit
         return c.scalar_str() if scalar else str(c)
 
-    def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False):
+    def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False,
+                strings=True):
         """
         ``top`` means the result already sits in a context that brackets it --
         the inside of a `*(u32 *)(...)`, or the whole right-hand side of an
@@ -274,20 +292,25 @@ class CGen(object):
         addresses are both like that.
         """
         if v.is_const:
-            return self.const(v, scalar)
+            return self.const(v, scalar, strings)
         if depth < MAX_INLINE_DEPTH and v.key() in self.inlinable:
             return self.rhs(self.defs[v.key()], depth + 1, top=top,
-                            want_scalar=want_scalar)
+                            want_scalar=want_scalar, strings=strings)
         return self.namer.name(v)
 
-    def addr(self, v, depth=0):
+    def addr(self, v, depth=0, strings=True):
         if v.is_const:
+            if strings:
+                lit = self.str_of(v.val >> 96)
+                if lit is not None:
+                    return lit
             return "0x%X" % (v.val >> 96)
-        return self.operand(v, depth, top=True, want_scalar=True)
+        return self.operand(v, depth, top=True, want_scalar=True,
+                            strings=strings)
 
     # -- right-hand sides --------------------------------------------------
 
-    def rhs(self, insn, depth=0, top=True, want_scalar=False):
+    def rhs(self, insn, depth=0, top=True, want_scalar=False, strings=True):
         op = insn.op
         sc = insn.scalar
 
@@ -304,9 +327,10 @@ class CGen(object):
             # unless the type positively says this value is a vector.
             if not sc and want_scalar and (t is None or t.kind != types.VEC):
                 sc = True
-            return self.const(insn.srcs[0], sc)
+            return self.const(insn.srcs[0], sc, strings)
         if op == Op.MOV:
-            return self.operand(insn.srcs[0], depth, sc, top=top)
+            return self.operand(insn.srcs[0], depth, sc, top=top,
+                                strings=strings)
         if op == Op.UNDEF:
             return "<clobbered by call>"
         if op == Op.PHI:
@@ -445,7 +469,11 @@ class CGen(object):
                 and pt.pointee is not None
                 and self._pointee_matches(pt.pointee, insn)):
             return "*%s" % self.namer.name(addr)
-        return "*(%s *)(%s)" % (t, self.addr(addr, depth))
+        # A store's destination never prints as a string literal: the bytes
+        # there may well be text today, but `*(char *)"..." = x` reads as an
+        # assignment to a constant rather than as a write into a buffer.
+        strings = insn.op not in (Op.STORE, Op.STOREQ)
+        return "*(%s *)(%s)" % (t, self.addr(addr, depth, strings=strings))
 
     @staticmethod
     def _pointee_matches(pointee, insn):
@@ -846,9 +874,9 @@ def _signature(g, func):
     return ret, (", ".join(plist) or "void")
 
 
-def generate(func, stmts, info, name_of=None, arity_of=None):
+def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None):
     """Render the structured AST as pseudocode lines."""
-    g = CGen(func, name_of, arity_of)
+    g = CGen(func, name_of, arity_of, str_of)
     name = func.name or "sub_%X" % func.start_ea
     ret, params = _signature(g, func)
 
@@ -872,6 +900,9 @@ def generate(func, stmts, info, name_of=None, arity_of=None):
         if ts.get("contradictions"):
             line += "  (%d contradictory -- suspect)" % ts["contradictions"]
         out.append(line)
+    if ts and ts.get("strings"):
+        out.append("// %d constant(s) resolved to string literals"
+                   % ts["strings"])
 
     if g.params:
         out.append("// parameters: %s"

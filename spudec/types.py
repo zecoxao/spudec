@@ -201,11 +201,16 @@ _LANEWISE = frozenset((Op.ADD, Op.SUB, Op.MUL, Op.CMPEQ, Op.CMPGT,
 
 class _Solver(object):
 
-    def __init__(self, func, demand, groups=None):
+    def __init__(self, func, demand, groups=None, is_string=None):
         self.func = func
         self.demand = demand
         self.ty = {}
-        self.stats = {"contradictions": 0, "ambiguous": 0}
+        # Whether a constant's preferred slot points at a NUL-terminated char
+        # array.  Supplied by the caller because answering it needs the
+        # database, and this module stays IDA-free; without it the rule simply
+        # never fires.
+        self.is_string = is_string or (lambda val: False)
+        self.stats = {"contradictions": 0, "ambiguous": 0, "strings": 0}
         # Values that share a printed variable must share a type.
         self.rep = {}
         if groups:
@@ -269,6 +274,17 @@ class _Solver(object):
         ch = False
         d = insn.defines()
         srcs = insn.srcs
+
+        # -- a constant that points at a string is a char pointer -----------
+        # The literal is what the renderer will print, so the declared type
+        # has to agree with it: `int r5; r5 = "text";` would be the listing
+        # contradicting itself.
+        if op == Op.CONST and d is not None and srcs and srcs[0].is_const:
+            if self.is_string(srcs[0].val):
+                if self.add(d.key(), ptr_to(Ty(INT, 1, True))):
+                    self.stats["strings"] += 1
+                    ch = True
+            return ch
 
         # -- memory: the strongest evidence there is ------------------------
         if op == Op.LOAD:
@@ -406,15 +422,18 @@ class _Solver(object):
         return self.ty, self.stats
 
 
-def infer(func, demand, groups=None):
+def infer(func, demand, groups=None, is_string=None):
     """
     Recover types for every SSA value.
 
     ``groups`` are sets of SSA keys that must share a type -- the phi webs the
-    renderer will print as one variable.  Returns ``(types, stats)`` where
-    ``types`` maps an SSA key (or its group representative) to a :class:`Ty`.
+    renderer will print as one variable.  ``is_string(value)`` says whether a
+    constant's preferred slot is the address of a NUL-terminated char array;
+    it needs the database, so the caller supplies it.  Returns
+    ``(types, stats)`` where ``types`` maps an SSA key (or its group
+    representative) to a :class:`Ty`.
     """
-    s = _Solver(func, demand, groups)
+    s = _Solver(func, demand, groups, is_string)
     tys, stats = s.solve()
     return _Types(tys, s.rep), stats
 

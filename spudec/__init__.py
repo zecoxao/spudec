@@ -166,7 +166,7 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
 
     stats = dict(functions=0, failed=0, problems=0, blocks=0, insns=0,
                  loops=0, gotos=0, stores=0, loads=0, scalars=0,
-                 unreachable=0, cancelled=False)
+                 unreachable=0, strings=0, cancelled=False)
     unhandled = {}
     failures = []
     body = []
@@ -201,6 +201,8 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
         stats["loads"] += sc.get("loads", 0) + sc.get("aligned_loads", 0)
         stats["scalars"] += sc.get("scalars", 0)
         stats["unreachable"] += len(getattr(func, "unreachable", ()))
+        stats["strings"] += (getattr(func, "type_stats", None)
+                             or {}).get("strings", 0)
         for k, v in func.unhandled.items():
             unhandled[k] = unhandled.get(k, 0) + v
 
@@ -228,6 +230,8 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
         % (stats["loops"], stats["gotos"]),
         "//   scalarised : %d stores, %d loads, %d scalar ops"
         % (stats["stores"], stats["loads"], stats["scalars"]),
+        "//   strings    : %d constant(s) resolved to string literals"
+        % stats["strings"],
     ]
     if stats["problems"]:
         head.append("//   SSA verifier problems: %d -- the affected functions "
@@ -253,17 +257,50 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
     return head + body, stats
 
 
-def pseudocode(ea, name_of=None, arity=None, **kw):
+_STRINGS = None
+
+
+def strings():
+    """
+    The shared constant-address-to-string-literal resolver.
+
+    One per session rather than one per function: the same format string is
+    referenced from many call sites, and the whole-database pass asks about
+    every constant in every function, so the cache is what keeps the lookups
+    from dominating the run.  Call :func:`clear_strings` after editing string
+    definitions in the database.
+    """
+    global _STRINGS
+    if _STRINGS is None:
+        from . import data
+        _STRINGS = data.Strings()
+    return _STRINGS
+
+
+def clear_strings():
+    """Forget recovered strings -- call after retyping data in the database."""
+    global _STRINGS
+    _STRINGS = None
+
+
+def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
     Returns the pseudocode as a list of lines.  The SSA IR it was rendered
     from is untouched, so ``dump()`` on the same address still shows the
     verifiable three-address form.
+
+    ``str_of`` resolves a constant address to a C string literal; it defaults
+    to the shared database-backed resolver, and passing ``lambda ea: None``
+    turns the feature off.
     """
     from . import cgen
     func = ea if isinstance(ea, Function) else decompile(ea, **kw)
     stmts, info = structured(func)
     if arity is None:
         arity = arity_of
-    return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity)
+    if str_of is None:
+        str_of = strings()
+    return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity,
+                         str_of=str_of)
