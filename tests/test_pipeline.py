@@ -357,6 +357,140 @@ def test_callee_demand_narrows_arguments():
     print()
 
 
+# ---------------------------------------------------------------------------
+# every mnemonic IDA decodes must have a real semantic, not an intrinsic
+# ---------------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Where IDA's SPU processor module might live.  Absence only costs the
+# cross-check; the coverage test itself runs from the checked-in list.
+SPU_PY_CANDIDATES = (
+    os.environ.get("SPU_PROC_PY"),
+    os.path.join(os.environ.get("IDADIR", ""), "procs", "spu.py"),
+    r"C:\ida94b1\procs\spu.py",
+    r"C:\Program Files\IDA Professional 9.4\procs\spu.py",
+)
+
+
+def _listed_mnemonics():
+    """The mnemonics recorded in ``tests/spu_mnemonics.txt``."""
+    out = []
+    for line in io.open(os.path.join(HERE, "spu_mnemonics.txt"),
+                        encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
+def _spu_py_mnemonics():
+    """The same, read out of spu.py, or ``None`` if no install was found."""
+    import re
+    for path in SPU_PY_CANDIDATES:
+        if not path or not os.path.exists(path):
+            continue
+        src = io.open(path, encoding="utf-8", errors="replace").read()
+        # Two ways spu.py names an instruction: the itable_* constructors and
+        # the few appended to Instructions by hand (`lr`, the ori shorthand).
+        found = re.findall(r'idef_\w*\(\s*"([a-z0-9.]+)"', src)
+        found += re.findall(
+            r"""Instructions\.append\(\{\s*'name'\s*:\s*["']([a-z0-9.]+)["']""",
+            src)
+        return sorted(set(found)), path
+    return None, None
+
+
+def _covered_mnemonics():
+    """
+    Every mnemonic ``lifter.Lifter.lift`` dispatches without falling through.
+
+    Read from the source rather than by importing: lifter.py imports IDA, and
+    this file deliberately runs without a database.  ``lift`` resolves a
+    mnemonic three ways -- a ``_i_<name>`` method, a class-body alias like
+    ``_i_lqr = _i_lqa`` where one semantic serves several mnemonics, or
+    membership of one of the ``self.<group>`` tables built in ``__init__`` --
+    so all three are collected.  Leaving the aliases out reported `bra`,
+    `brasl`, `lqr` and `stqr` as uncovered when they are handled.
+    """
+    import ast
+    src = io.open(os.path.join(HERE, "..", "spudec", "lifter.py"),
+                  encoding="utf-8").read()
+    tree = ast.parse(src)
+    covered = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name.startswith("_i_"):
+            covered.add(node.name[3:])
+        if not isinstance(node, ast.Assign):
+            continue
+        for t in node.targets:
+            if isinstance(t, ast.Name) and t.id.startswith("_i_"):
+                covered.add(t.id[3:])
+        if not any(isinstance(t, ast.Attribute)
+                   and isinstance(t.value, ast.Name)
+                   and t.value.id == "self" for t in node.targets):
+            continue
+        v = node.value
+        # A dict's *keys* are mnemonics; its values are Op/EW enums.  A
+        # frozenset/tuple/list holds mnemonics directly.
+        items = []
+        if isinstance(v, ast.Dict):
+            items = v.keys
+        elif isinstance(v, (ast.Set, ast.Tuple, ast.List)):
+            items = v.elts
+        elif isinstance(v, ast.Call) and v.args and isinstance(
+                v.args[0], (ast.Set, ast.Tuple, ast.List)):
+            items = v.args[0].elts          # frozenset((...))
+        for k in items:
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                covered.add(k.value)
+    return covered
+
+
+def test_every_mnemonic_has_semantics():
+    """
+    Anything without a hand-written semantic becomes an ``INTRINSIC``: sound,
+    since its defs and uses stay right, but opaque -- the listing shows
+    ``intr dftsv(...)`` and type recovery learns nothing.  That is invisible
+    in the corpus numbers, because a mnemonic no PS3 module happens to use
+    reports zero unmodelled hits while still being unmodelled.  `bisled`,
+    `fscrrd`, `fscrwr` and `dftsv` sat that way unnoticed.
+
+    So the gate is the decoder's whole instruction set, not the corpus: every
+    mnemonic spu.py decodes must resolve to a handler or a dispatch table.
+    """
+    listed = _listed_mnemonics()
+    covered = _covered_mnemonics()
+
+    # `lift` looks up `_i_` + name.replace(".", "_"), so a dotted mnemonic is
+    # covered by the underscored method name.
+    missing = [m for m in listed
+               if m not in covered and m.replace(".", "_") not in covered]
+    assert not missing, (
+        "%d of %d mnemonics fall through to an intrinsic: %s"
+        % (len(missing), len(listed), ", ".join(missing)))
+
+    # And the list itself must not drift away from the module it describes.
+    actual, path = _spu_py_mnemonics()
+    if actual is None:
+        note = "list not cross-checked (no IDA install found)"
+    else:
+        stale = sorted(set(actual) - set(listed))
+        gone = sorted(set(listed) - set(actual))
+        assert not stale and not gone, (
+            "tests/spu_mnemonics.txt disagrees with %s:%s%s%s"
+            % (path,
+               chr(10) + "  only in spu.py: " + ", ".join(stale) if stale
+               else "",
+               chr(10) + "  only in the list: " + ", ".join(gone) if gone
+               else "",
+               chr(10) + "regenerate the list if spu.py really changed."))
+        note = "cross-checked against " + os.path.basename(path)
+    print("all %d SPU mnemonics have semantics (%s)" % (len(listed), note))
+    print()
+
+
 def main():
     """
     Run every ``test_*`` in this file, in definition order.

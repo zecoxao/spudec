@@ -94,6 +94,18 @@ def fsmbi_const(imm16):
 # ---------------------------------------------------------------------------
 
 
+# The seven value categories `dftsv` can test for, most significant bit of
+# the I7 field first (SPU ISA v1.2 page 230).
+DFTSV_CLASSES = ("nan", "+inf", "-inf", "+0", "-0", "+denorm", "-denorm")
+
+
+def dftsv_classes(sel):
+    """The categories an I7 field selects, as a readable string."""
+    names = [n for i, n in enumerate(DFTSV_CLASSES)
+             if sel & (0x40 >> i)]
+    return "|".join(names) if names else "none"
+
+
 class LiftError(Exception):
     pass
 
@@ -744,6 +756,77 @@ class Lifter(object):
                   [Var(regs.R_SPR), self.r(insn.Op2)], EW.Q,
                   aux=insn.Op1.reg - 128)
 
+
+    # -- the last four, from the ISA manual -------------------------------
+
+    def _i_bisled(self, insn, name):
+        """
+        Branch Indirect and Set Link if External Data (ISA page 180).
+
+        The link is written whether or not the branch is taken -- in the
+        manual's pseudocode `RT0:3 <- LSLR & (PC + 4)` sits above the `if`.
+        Only the transfer of control is conditional, on an external-data
+        event, which is not a register this IR models; it is read out of the
+        channel/event facility, so the test is an opaque read of the channel
+        chain yielding 0 or 1.
+
+        CIJMP is not a terminator, so control correctly falls through when the
+        event is absent -- and spu.py agrees, marking `bisled` CF_JUMP without
+        CF_STOP, so IDA's flow graph keeps that edge too.
+
+        What this does *not* model: if the branch target behaves as a callee
+        and returns through the link, its register clobbers are invisible
+        here.  IDA classifies `bisled` as a jump rather than a call, and this
+        follows that reading rather than inventing a clobber set.
+        """
+        self._link(insn.Op1.reg)
+        c = self.tmp()
+        self.emit(Op.INTRINSIC, c, [Var(regs.R_CH)], EW.W,
+                  aux="external_event",
+                  comment="pending external-data event")
+        self.emit(Op.CIJMP, None, [Var(c), self.r(insn.Op2)], aux="nz",
+                  comment="branch if the external condition holds")
+
+    def _i_fscrrd(self, insn, name):
+        """
+        Floating-Point Status and Control Register Read (ISA page 236).
+
+        Reads the whole 128-bit FPSCR into RT with the unused bits forced to
+        zero.  Threaded through the SPR pseudo-register: the FPSCR is not an
+        SPR, but that is the existing carrier for machine state of this kind,
+        and using it keeps a read ordered against a nearby `fscrwr` instead of
+        letting the two float apart.
+        """
+        self.emit(Op.INTRINSIC, insn.Op1.reg, [Var(regs.R_SPR)], EW.Q,
+                  aux="fscrrd")
+
+    def _i_fscrwr(self, insn, name):
+        """
+        Floating-Point Status and Control Register Write (ISA page 235).
+
+        RT is a *false target*.  The manual is explicit -- "Implementations
+        can schedule instructions as though this instruction produces a value
+        into RT... False targets are not written" -- but spu.py reports
+        CF_CHG1 so that IDA models the scheduling dependency, and the generic
+        intrinsic path trusts CF_CHG1.  That would have claimed RT is written
+        and clobbered a live value, so this defines only the FPSCR.
+        """
+        self.emit(Op.INTRINSIC, regs.R_SPR,
+                  [Var(regs.R_SPR), self.r(insn.Op2)], EW.Q, aux="fscrwr")
+
+    def _i_dftsv(self, insn, name):
+        """
+        Double Floating Test Special Value (ISA page 230).
+
+        For each of two doubleword slots, the double in RA is tested against
+        the categories the 7-bit immediate selects; RT gets all ones in that
+        slot if any enabled test matches, all zeros otherwise.  Naming the
+        categories is the whole value of lifting this by hand -- `dftsv(a,
+        nan|+inf)` says what `intr dftsv` does not.
+        """
+        sel = self.imm(insn.Op3) & 0x7F
+        self.emit(Op.DFTSV, insn.Op1.reg, [self.r(insn.Op2)], EW.D,
+                  aux=dftsv_classes(sel))
 
 # ---------------------------------------------------------------------------
 # driver

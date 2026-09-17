@@ -320,6 +320,13 @@ class _Solver(object):
             if d:
                 ch |= self.add(d.key(), Ty(FLT, 4, True))
             return ch
+        if op == Op.DFTSV:
+            # Tests a double and yields a per-doubleword mask.
+            if srcs:
+                ch |= self.add_val(srcs[0], Ty(FLT, 8, True))
+            if d is not None:
+                ch |= self.add(d.key(), Ty(VEC, 8))
+            return ch
         if op in (Op.CFLTS, Op.CFLTU):
             ch |= self.add_val(srcs[0], Ty(FLT, 4, True))
             if d:
