@@ -34,7 +34,7 @@ No IDA imports; pass ``name_of`` to resolve call targets to real symbol names.
 
 from .ir import (Op, EW, OP_NAME, INFIX, MEM_READS, MEM_WRITES, ABI_OPS,
                  EW_SUFFIX)
-from . import regs, channels
+from . import regs, channels, types
 from .structure import (Basic, If, Loop, Break, Continue, Goto, Label,
                         Return, Tail)
 
@@ -66,6 +66,13 @@ class Namer(object):
         ra, rb = self._find(a), self._find(b)
         if ra != rb:
             self._parent[rb] = ra
+
+    def webs(self):
+        """The groups of SSA keys that print as one variable."""
+        out = {}
+        for k in self._parent:
+            out.setdefault(self._find(k), set()).add(k)
+        return list(out.values())
 
     def _build(self, func):
         keys = []
@@ -162,6 +169,19 @@ class CGen(object):
         self.mute = _muted_clobbers(func)
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
+        # Recover types now rather than earlier in the pipeline: inference has
+        # to unify across the namer's webs, since everything printed under one
+        # variable name must end up with one type.
+        self.types = getattr(func, "types", None)
+        if self.types is None:
+            from . import lanes
+            demand = getattr(func, "demand", None)
+            if demand is None:
+                demand = lanes.compute_demand(func)
+            self.types, stats = types.infer(func, demand, self.namer.webs())
+            stats["kinds"] = self.types.counts()
+            func.types = self.types
+            func.type_stats = stats
 
     # -- operands ----------------------------------------------------------
 
@@ -192,6 +212,15 @@ class CGen(object):
         sc = insn.scalar
 
         if op == Op.CONST:
+            # A constant assigned to something the types say is a scalar
+            # prints as a scalar, even when the lifter could not prove it was
+            # one: `0x3e000` rather than `#0x3e000:w4`.
+            if not sc and insn.dst is not None:
+                t = self.type_of(insn.dst)
+                if t is not None and t.kind in (types.INT, types.PTR,
+                                                types.UNK) \
+                        and t.width in (1, 2, 4):
+                    sc = True
             return self.const(insn.srcs[0], sc)
         if op == Op.MOV:
             return self.operand(insn.srcs[0], depth, sc, top=top)
@@ -201,10 +230,7 @@ class CGen(object):
             return "phi(%s)" % ", ".join(self.operand(s, depth, sc)
                                          for s in insn.srcs)
         if op in (Op.LOAD, Op.LOADQ, Op.LOADU):
-            t = CTYPE[insn.ew] if op == Op.LOAD else "qword"
-            if op == Op.LOADU:
-                t = "qword_unaligned"
-            return "*(%s *)(%s)" % (t, self.addr(insn.srcs[1], depth))
+            return self._deref(insn, depth)
         if op in (Op.CALL, Op.ICALL):
             tgt = (self.name_of(insn.aux) if op == Op.CALL
                    else "(*%s)" % self.operand(insn.srcs[0], depth))
@@ -237,6 +263,95 @@ class CGen(object):
         if insn.aux is not None and op not in (Op.CALL,):
             args = args + (", " if args else "") + "/*%s*/" % (insn.aux,)
         return "%s(%s)" % (name, args)
+
+    # -- typed rendering ---------------------------------------------------
+
+    def type_of(self, v):
+        return self.types.of_var(v) if self.types is not None else None
+
+    def ctype(self, ty, fallback="qword"):
+        """
+        The fallback is for types that say nothing at all.  A kind of UNK with
+        a known width still says the width, and Ty renders that as an integer.
+        """
+        if ty is None:
+            return fallback
+        if ty.kind == types.UNK and ty.width not in (1, 2, 4, 8):
+            return fallback
+        return str(ty)
+
+    def _access_type(self, insn):
+        """The C type a load/store moves."""
+        if insn.op in (Op.LOADQ, Op.STOREQ):
+            return "qword"
+        if insn.op == Op.LOADU:
+            return "qword_unaligned"
+        # Prefer the recovered element type over the bare width: it carries
+        # signedness, and float where the ISA proved it.
+        ty = None
+        if insn.op == Op.LOAD:
+            ty = self.type_of(insn.dst) if insn.dst is not None else None
+        else:
+            ty = self.type_of(insn.srcs[2])
+        if ty is not None and ty.kind in (types.INT, types.FLT) \
+                and ty.width == int(insn.ew):
+            return str(ty)
+        return CTYPE[insn.ew]
+
+    def _deref(self, insn, depth=0):
+        """
+        `*p` when the address is a pointer of the right shape, `*(T *)(e)`
+        otherwise.  The cast is not decoration -- it is the only thing saying
+        how wide the access is when the pointer type is not known.
+        """
+        addr = insn.srcs[1]
+        t = self._access_type(insn)
+        pt = self.type_of(addr)
+        if (pt is not None and pt.kind == types.PTR and addr.is_var
+                and addr.key() not in self.inlinable
+                and pt.pointee is not None
+                and self._pointee_matches(pt.pointee, insn)):
+            return "*%s" % self.namer.name(addr)
+        return "*(%s *)(%s)" % (t, self.addr(addr, depth))
+
+    @staticmethod
+    def _pointee_matches(pointee, insn):
+        if insn.op in (Op.LOADQ, Op.STOREQ, Op.LOADU):
+            return pointee.kind == types.VEC
+        return pointee.width == int(insn.ew)
+
+    def declarations(self):
+        """
+        Locals, grouped by type -- the part that makes the output read as C
+        rather than as a register listing.
+        """
+        if self.types is None:
+            return []
+        params = set(_params(self.func))
+        by_name = {}
+        for insn in self.func.insns():
+            d = insn.defines()
+            if d is None or d.reg in regs.PSEUDO:
+                continue
+            nm = self.namer.name(d)
+            if nm in by_name or d.reg in params:
+                continue
+            by_name[nm] = self.ctype(self.type_of(d))
+
+        if not by_name:
+            return []
+        groups = {}
+        for nm, ct in by_name.items():
+            groups.setdefault(ct, []).append(nm)
+
+        out = []
+        for ct in sorted(groups):
+            names = sorted(groups[ct])
+            sep = "" if ct.endswith("*") else " "
+            while names:
+                chunk, names = names[:8], names[8:]
+                out.append("    %s%s%s;" % (ct, sep, ", ".join(chunk)))
+        return out
 
     # -- statements --------------------------------------------------------
 
@@ -273,15 +388,10 @@ class CGen(object):
             return "if ( %s ) goto *%s;" % (
                 test, self.operand(insn.srcs[1], 0, True))
 
-        if op == Op.STORE:
-            return "*(%s *)(%s) = %s;" % (CTYPE[insn.ew],
-                                          self.addr(insn.srcs[1]),
-                                          self.operand(insn.srcs[2], 0, True,
-                                                       top=True))
-        if op == Op.STOREQ:
-            return "*(qword *)(%s) = %s;" % (self.addr(insn.srcs[1]),
-                                             self.operand(insn.srcs[2], 0,
-                                                          False))
+        if op in (Op.STORE, Op.STOREQ):
+            return "%s = %s;" % (
+                self._deref(insn),
+                self.operand(insn.srcs[2], 0, op == Op.STORE, top=True))
         if op == Op.WRCH:
             val = self.operand(insn.srcs[1], 0, True, top=True)
             text = "wrch(%s, %s);" % (channels.label(insn.aux), val)
@@ -446,12 +556,32 @@ def _params(func):
     return sorted(live_in)
 
 
+def _signature(g, func):
+    """Return type and parameter list, from the recovered types."""
+    plist = []
+    for r in _params(func):
+        ty = g.types.of((r, 0)) if g.types is not None else None
+        nm = regs.reg_name(r)
+        ct = g.ctype(ty)
+        plist.append("%s%s%s" % (ct, "" if ct.endswith("*") else " ", nm))
+
+    # The return type is whatever r3 holds where the function returns.
+    ret = "void"
+    for insn in func.insns():
+        if insn.op != Op.RET:
+            continue
+        for s in insn.srcs:
+            if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
+                ret = g.ctype(g.type_of(s), "qword")
+                break
+    return ret, (", ".join(plist) or "void")
+
+
 def generate(func, stmts, info, name_of=None):
     """Render the structured AST as pseudocode lines."""
     g = CGen(func, name_of)
     name = func.name or "sub_%X" % func.start_ea
-    params = ", ".join("qword %s" % regs.reg_name(r) for r in _params(func)) \
-        or "void"
+    ret, params = _signature(g, func)
 
     out = ["// %s  @ 0x%X" % (name, func.start_ea)]
     sc = getattr(func, "scalar_stats", {}) or {}
@@ -464,8 +594,23 @@ def generate(func, stmts, info, name_of=None):
                % (info.get("loops", 0), info.get("gotos", 0),
                   "" if not info.get("unreached")
                   else ", %d block(s) not reached" % len(info["unreached"])))
-    out.append("void %s(%s)" % (name, params))
+    ts = getattr(func, "type_stats", None)
+    if ts and ts.get("kinds"):
+        bits = ["%s %d" % kv for kv in sorted(ts["kinds"].items())]
+        line = "// types: %s" % ", ".join(bits)
+        if ts.get("ambiguous"):
+            line += "  (%d read both signed and unsigned)" % ts["ambiguous"]
+        if ts.get("contradictions"):
+            line += "  (%d contradictory -- suspect)" % ts["contradictions"]
+        out.append(line)
+
+    sep = "" if ret.endswith("*") else " "
+    out.append("%s%s%s(%s)" % (ret, sep, name, params))
     out.append("{")
+    decls = g.declarations()
+    if decls:
+        out.extend(decls)
+        out.append("")
     info = dict(info, labels=set(info.get("labels", ())))
     g.emit(stmts, out, 1, info)
     out.append("}")

@@ -185,3 +185,60 @@ def show(func, mode="c"):
         return None
     v.Show()
     return v
+
+
+class ListingViewer(ida_kernwin.simplecustviewer_t):
+    """
+    A plain scrollable listing, for the whole-database decompilation.
+
+    Double-click on a `// name @ 0xEA` header line jumps there, which is the
+    only navigation that makes sense in a listing of a few hundred functions.
+    """
+
+    def __init__(self):
+        super(ListingViewer, self).__init__()
+        self.line_ea = []
+
+    def build(self, title, lines):
+        if not self.Create(title):
+            return False
+        self.line_ea = []
+        for ln in lines:
+            ea = None
+            m = _HEADER_EA.search(ln)
+            if m:
+                try:
+                    ea = int(m.group(1), 16)
+                except ValueError:
+                    ea = None
+            self.AddLine(_colour_c(ln))
+            self.line_ea.append(ea)
+        return True
+
+    def OnDblClick(self, shift):
+        n = self.GetLineNo()
+        if n is None or n >= len(self.line_ea):
+            return False
+        ea = self.line_ea[n]
+        if ea is None:
+            return False
+        idaapi.jumpto(ea)
+        return True
+
+    def OnKeydown(self, vkey, shift):
+        if vkey == 27:
+            self.Close()
+            return True
+        return False
+
+
+import re
+_HEADER_EA = re.compile(r"@\s*0x([0-9A-Fa-f]+)")
+
+
+def show_listing(title, lines):
+    v = ListingViewer()
+    if not v.build(title, lines):
+        return None
+    v.Show()
+    return v

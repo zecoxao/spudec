@@ -29,9 +29,18 @@ Copy `spudec_plugin.py` **and** the `spudec/` directory side by side into:
 %APPDATA%\Hex-Rays\IDA Pro\plugins\
 ```
 
-Press <kbd>Ctrl-Shift-S</kbd> inside an SPU function for pseudocode;
-<kbd>i</kbd> toggles to the SSA IR it was rendered from, and double-clicking an
-IR line jumps the disassembly to the address it came from.
+| key | what |
+|---|---|
+| <kbd>Ctrl-Shift-S</kbd> | decompile the function under the cursor |
+| <kbd>Ctrl-F5</kbd> | decompile everything in the database |
+| <kbd>i</kbd> (in the viewer) | toggle pseudocode / the SSA IR it came from |
+| double-click | jump the disassembly to that line's address |
+
+<kbd>Ctrl-F5</kbd> mirrors Hex-Rays' "Decompile all": every function into one
+listing, with a progress box you can cancel (a cancelled run still returns
+what it produced), then a prompt to save it as a `.c` file. Past 60k lines it
+offers the file only — a custom viewer holding a few hundred thousand lines is
+slow to build and painful to scroll.
 
 From the IDA console:
 
@@ -41,7 +50,18 @@ print("\n".join(spudec.pseudocode(here())))   # structured pseudocode
 print(spudec.dump(here()))                    # optimised SSA IR
 print(spudec.dump(here(), optimize_ir=False)) # raw lifting
 func = spudec.decompile(here(), check=True)   # func.problems = verifier output
+
+lines, stats = spudec.decompile_all()         # the whole database
+open("out.c", "w").write("\n".join(lines))
 ```
+
+The whole-database listing opens with a header giving the counts that matter —
+functions decompiled and failed, loops, gotos, what was scalarised, any SSA
+verifier problems, any unmodelled mnemonics. A function that fails to decompile
+is reported inline as a comment rather than skipped, and unreachable ranges are
+marked where they would have appeared: a listing that quietly omits code is
+worse than one that admits a gap. metldr (189 functions) takes 1.8s and comes
+out at about 10k lines.
 
 ## Patched `spu.py`
 
@@ -306,6 +326,62 @@ the terminator and vanished from the output; and `biz`/`binz`/`bihz`/`bihnz`
 were lifted as an *unconditional* indirect jump, turning a conditional branch
 into an unconditional one. Both are fixed and covered by tests.
 
+## Type recovery
+
+The SPU hands over an unusual amount of type evidence, so `types.py` is
+constraint propagation over the SSA graph rather than guesswork. Every rule is
+anchored to an instruction that can only mean one thing:
+
+| evidence | from |
+|---|---|
+| **width** | demand analysis — byte 3 alone is a `char`, bytes 0..3 an `int` |
+| **signedness** | the opcode: `cgt` vs `clgt`, `rotma` vs `rotm`, `xsbh`/`xshw`/`xswd` |
+| **float** | `fa`/`fm`/`dfa` and the four conversion instructions |
+| **pointers** | use as an address — the operand of a `load.w` points at 4 bytes |
+
+Width from demand is the part no other architecture gives you for free. It
+comes straight out of the analysis the scalarisation pass already needed.
+
+Two judgement calls worth stating:
+
+**A demand mask of `ALL` is the default, not evidence.** Every call and return
+carries an ABI operand list that demands all sixteen bytes, because a callee
+might read them. Treating that as "this is a vector" made every value reaching
+a return look like one. Only a mask *narrower* than ALL says anything.
+
+**Scalar or vector is already answered.** `insn.scalar` means demand analysis
+proved nothing reads outside the preferred slot. Re-deriving it here would be
+strictly worse, so the inference just uses it.
+
+Conflicting evidence is recorded, not resolved: the same bits read signed in
+one place and unsigned in another is ordinary, so that is marked *ambiguous*
+and rendered unsigned. A real contradiction — float evidence meeting pointer
+evidence — is counted and reported in the function header, because it usually
+means a lifting bug and hiding it wastes the signal.
+
+That distinction mattered. The first version counted any mismatched kinds as a
+contradiction and flagged 26 of metldr's 189 functions. They were all vector
+meeting scalar — which on a machine where *every* register is 128 bits is not a
+conflict at all: "the whole quadword is used" and "the preferred slot holds an
+address" are routinely both true. Narrowing the rule to float-versus-pointer
+took it to zero, leaving 11 genuinely ambiguous signedness cases.
+
+Output gains a declarations block, a typed signature, `*p` instead of
+`*(u32 *)(p)` where the pointer type is known, and scalar-spelled constants:
+
+```c
+void __vector_Reset(void)
+{
+    unsigned int r14;
+
+    r14 = 0x630;
+    goto *r14;   // indirect / tail call
+}
+```
+
+On metldr: 2102 integers, 2056 pointers, 5242 vectors across 189 functions,
+129 of which get a non-`void` return type.
+
 ## Checked against a hand-written reference
 
 `rom_pseudo_code.c` — a human annotation of this same boot ROM — was used as
@@ -423,11 +499,11 @@ reads as one range rather than 339 — without that the corpus figure reads
   live with different values. That is the standard decompiler assumption and
   holds for compiler output, but it is an assumption — the SSA view (`i` in
   the viewer) is the ground truth if a rendering ever looks wrong.
-- No type recovery: everything is `qword` or a fixed-width integer.
-- Switch dispatch is not resolved. IDA's SPU processor module produces no
-  edges for a `bi` through a jump table, so case bodies arrive as unreachable
-  blocks; they are reported, not decompiled. Fixing this properly belongs in
-  the processor module, as switch recognition.
+- Type recovery stops at scalars, pointers and vectors. No structs, no arrays,
+  no typedefs: `p->field` and `a[i]` still read as pointer arithmetic.
+- Switch dispatch is resolved only for the GCC jump-table idiom the patched
+  `spu.py` matches. Other shapes still arrive as unreachable blocks; they are
+  reported, not decompiled.
 - Code unreachable from a function's entry is reported, not decompiled. Create
   a function at the address and it will be.
 - Analysis is per-function, so cross-function idioms are not recovered. The
