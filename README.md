@@ -274,7 +274,12 @@ verifier still applies to it.
 
 ## Tests
 
+The harnesses live in `spudec-dev/` beside this repository, so the repo holds
+only what you install into IDA. They locate the package in the sibling repo
+automatically and write their output beside themselves, never in here.
+
 ```
+cd ../spudec-dev
 python selftest.py                       # ir / sem / ssa / opt, no IDA needed
 python romscan.py <blob>                 # endianness probe + lifter coverage
 ```
