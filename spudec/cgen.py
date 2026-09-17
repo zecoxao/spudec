@@ -214,7 +214,50 @@ def _inlinable(func, call_args=None):
                    for j in range(i0 + 1, i1)):
                 continue
         ok.add(key)
+
+    # -- apply the depth cap here, not while rendering --------------------
+    #
+    # `operand` only inlines while `depth < MAX_INLINE_DEPTH`; past that it
+    # prints the definition's name instead, and `insn_stmt` has already
+    # dropped the definition as a statement.  That combination names a
+    # variable the listing never computes.  Position in the chain is
+    # knowable now, so drop the candidates that would sit too deep and let
+    # them stay statements.  Removing one shortens every chain through it,
+    # hence the fixpoint.
+    while True:
+        pos = _chain_positions(ok, defs, use_site)
+        too_deep = {k for k, p in pos.items() if p >= MAX_INLINE_DEPTH}
+        if not too_deep:
+            break
+        ok -= too_deep
     return ok, defs
+
+
+def _chain_positions(ok, defs, use_site):
+    """
+    How deep each inline candidate would be rendered.
+
+    Zero when its use site is printed as a statement, one more than its
+    consumer when the consumer is itself inlined.  SSA plus the single-use
+    requirement make the chains acyclic, but the ``seen`` set keeps a cycle
+    from recursing forever if either ever stops holding.
+    """
+    pos = {}
+
+    def walk(key, seen):
+        if key in pos:
+            return pos[key]
+        site = use_site.get(key)
+        d = site.defines() if site is not None else None
+        if d is None or d.key() not in ok or d.key() in seen:
+            pos[key] = 0
+        else:
+            pos[key] = walk(d.key(), seen | {key}) + 1
+        return pos[key]
+
+    for key in ok:
+        walk(key, {key})
+    return pos
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +305,10 @@ class CGen(object):
         # visible statement, or the value would vanish from the listing.
         self.inlinable, self.defs = _inlinable(func, self.call_args)
         self.name_of = name_of or (lambda ea: "sub_%X" % ea)
-        self.mute = _muted_clobbers(func)
+        # Names the rendered body actually mentions; `declarations` declares
+        # exactly these, so the two can never disagree.
+        self.printed = set()
+        self.mute = _muted_clobbers(func, self._rendered_keys())
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
         # Recover types now rather than earlier in the pipeline: inference has
@@ -282,6 +328,27 @@ class CGen(object):
             func.type_stats = stats
 
     # -- operands ----------------------------------------------------------
+
+    def _rendered_keys(self):
+        """
+        Keys whose *name* the body will print even though nothing in this
+        function reads them as code: a call's rendered arguments, and the
+        value the return statement forwards.  A clobber among them must keep
+        its assignment or the listing names a variable it never sets.
+        """
+        keys = set()
+        for args in self.call_args.values():
+            for a in args:
+                if a.is_var:
+                    keys.add(a.key())
+        return keys
+
+    def nm(self, v):
+        """The printed name of a value, recording that it was printed."""
+        name = self.namer.name(v)
+        self.printed.add(name)
+        return name
+
 
     def const(self, c, scalar, strings=True):
         """
@@ -315,7 +382,7 @@ class CGen(object):
         if depth < MAX_INLINE_DEPTH and v.key() in self.inlinable:
             return self.rhs(self.defs[v.key()], depth + 1, top=top,
                             want_scalar=want_scalar, strings=strings)
-        return self.namer.name(v)
+        return self.nm(v)
 
     def addr(self, v, depth=0, strings=True):
         if v.is_const:
@@ -487,7 +554,7 @@ class CGen(object):
                 and addr.key() not in self.inlinable
                 and pt.pointee is not None
                 and self._pointee_matches(pt.pointee, insn)):
-            return "*%s" % self.namer.name(addr)
+            return "*%s" % self.nm(addr)
         # A store's destination never prints as a string literal: the bytes
         # there may well be text today, but `*(char *)"..." = x` reads as an
         # assignment to a constant rather than as a write into a buffer.
@@ -504,6 +571,12 @@ class CGen(object):
         """
         Locals, grouped by type -- the part that makes the output read as C
         rather than as a register listing.
+
+        Must be called *after* the body has been rendered: it declares exactly
+        the names the body printed (see :attr:`printed`).  Deciding in advance
+        which names the renderer would emit is what previously left deeply
+        nested expressions, and muted clobbers read as call arguments,
+        mentioning variables nothing declared.
         """
         if self.types is None:
             return []
@@ -517,9 +590,21 @@ class CGen(object):
             d = insn.defines()
             if d is None or d.reg in regs.PSEUDO:
                 continue
-            if d.key() in self.inlinable:
-                continue          # printed at its use site, never as a name
+            if self._suppressed(insn, d):
+                # This definition prints nothing, so it says nothing about
+                # the name's type or its group.  A register that is both
+                # live in and written by a call's link constant reaches here,
+                # and belongs in the live-in group below rather than being
+                # claimed as a local that is never assigned.
+                continue
             nm = self.namer.name(d)
+            if nm not in self.printed:
+                # Folded into its use site, or simply dead -- either way the
+                # body never mentions the name.  Note this must NOT test
+                # `inlinable` on its own: it is `_inlinable`'s depth pruning
+                # that guarantees an inlined definition never falls back to
+                # printing its name.
+                continue
             if nm in by_name or nm in pnames:
                 continue
             by_name[nm] = self.ctype(self.type_of(d))
@@ -530,12 +615,18 @@ class CGen(object):
         # mean the listing uses names it never declares.
         live_in = {}
         for insn in self.func.insns():
-            if insn.op in ABI_OPS:
-                continue
-            for u in insn.uses():
+            # An ABI op's operand list is conservative filler, except for the
+            # leading operands `ABI_OPS` calls real -- an indirect branch's
+            # target among them.  Skipping those too left `goto *r3;` naming a
+            # register the listing never declared.
+            n_real = ABI_OPS.get(insn.op)
+            srcs = insn.srcs if n_real is None else insn.srcs[:n_real]
+            for u in [x for x in srcs if x.is_var]:
                 if u.ver != 0 or u.reg in regs.PSEUDO:
                     continue
                 nm = self.namer.name(u)
+                if nm not in self.printed:
+                    continue      # the body never mentions it
                 if nm in pnames or nm in by_name or nm in live_in:
                     continue
                 live_in[nm] = self.ctype(self.type_of(u))
@@ -560,6 +651,32 @@ class CGen(object):
 
     # -- statements --------------------------------------------------------
 
+    def _suppressed(self, insn, d):
+        """
+        Whether this definition never reaches the output at all.
+
+        Both :meth:`insn_stmt` and :meth:`declarations` need to know: a
+        variable that is never assigned anywhere in the listing must not be
+        declared either, or the reader is left hunting for a value that is not
+        there.  A whole prologue's worth of saved registers used to be
+        declared and never mentioned again for exactly that reason.
+        """
+        if insn.op == Op.PHI:
+            return True
+        if insn.op == Op.UNDEF:
+            # A clobber nothing real reads is noise; one in a return-value
+            # register at a call site does print, as `<result in rN>`.
+            if d.key() in self.mute:
+                return True
+            return not (insn.ea in self.call_at
+                        and regs.ARG_FIRST <= d.reg <= regs.ARG_LAST)
+        # The link value a `brsl` writes is the return address; the call is
+        # printed on the next line and says the same thing more clearly.
+        if (insn.op == Op.CONST and d.reg == regs.LR
+                and insn.ea in self.call_at):
+            return True
+        return False
+
     def insn_stmt(self, insn):
         """One IR instruction as a statement, or None if it is absorbed."""
         op = insn.op
@@ -569,20 +686,15 @@ class CGen(object):
         if d is not None and d.key() in self.inlinable:
             return None                       # printed at its use site
         if op == Op.UNDEF and d is not None:
-            if d.key() in self.mute:
-                return None                   # nothing real reads it
+            if self._suppressed(insn, d):
+                return None
             # A clobber sitting on a call, in a register the ABI uses for
             # return values (r3..r74), is the callee's result.  The call
             # statement is printed immediately above, so naming the callee
             # again on each line would read as several separate calls.
-            if (insn.ea in self.call_at
-                    and regs.ARG_FIRST <= d.reg <= regs.ARG_LAST):
-                return "%s = <result in %s>;" % (self.namer.name(d),
-                                                 regs.reg_name(d.reg))
-        # The link value a `brsl` writes is the return address; the call is
-        # printed on the next line and says the same thing more clearly.
-        if (op == Op.CONST and d is not None and d.reg == regs.LR
-                and insn.ea in self.call_at):
+            return "%s = <result in %s>;" % (self.nm(d),
+                                             regs.reg_name(d.reg))
+        if d is not None and self._suppressed(insn, d):
             return None
         if op == Op.CIJMP:
             kind = insn.aux or "z"
@@ -622,7 +734,7 @@ class CGen(object):
         if op in (Op.CALL, Op.ICALL):
             text = self.rhs(insn)
             if d is not None and d.reg not in regs.PSEUDO:
-                return "%s = %s;" % (self.namer.name(d), text)
+                return "%s = %s;" % (self.nm(d), text)
             return text + ";"
         if op == Op.NOP:
             return None
@@ -631,7 +743,7 @@ class CGen(object):
             return self.rhs(insn) + ";"
         if d.reg in regs.PSEUDO:
             return None                       # pure bookkeeping, not code
-        return "%s = %s;" % (self.namer.name(d), self.rhs(insn))
+        return "%s = %s;" % (self.nm(d), self.rhs(insn))
 
     # -- the AST -----------------------------------------------------------
 
@@ -712,7 +824,7 @@ class CGen(object):
             return "stop(%s);" % (insn.aux,)
         for s in insn.srcs:
             if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
-                return "return %s;" % self.namer.name(s)
+                return "return %s;" % self.nm(s)
         return "return;"
 
 
@@ -744,7 +856,7 @@ def _decl_lines(ctype, names, suffix=""):
     return out
 
 
-def _muted_clobbers(func):
+def _muted_clobbers(func, keep=()):
     """
     Clobbers whose only readers are a later call's ABI operand list.
 
@@ -753,23 +865,48 @@ def _muted_clobbers(func):
     conservative argument list of the next call is noise, not information.  A
     clobber that a real instruction reads is kept: that one says the code is
     using a register the callee destroyed, which is worth seeing.
+
+    "Read by a phi" is not by itself evidence either, and this used to count
+    it as such.  A clobber that feeds a phi whose own result only ever reaches
+    another ABI operand list is just as dead as one read directly from an ABI
+    list -- the value never reaches code -- and on a call-heavy function that
+    mistake accounted for most of the `<result in rN>` lines in the listing.
+    :func:`_real_uses` already draws that distinction transitively, so use it
+    rather than a second, weaker rule.
     """
-    real_use = set()
-    for insn in func.insns():
-        if insn.op in ABI_OPS:
-            continue
-        for u in insn.uses():
-            real_use.add(u.key())
+    real_use = _real_uses(func, set(keep or ()) | _returned_keys(func))
     return {i.dst.key() for i in func.insns()
             if i.op == Op.UNDEF and i.dst is not None
             and i.dst.key() not in real_use}
+
+
+def _returned_keys(func):
+    """
+    The values the return statement will name.
+
+    A function whose last act is to forward a callee's result -- a wrapper
+    ending in `return memset(...)` -- returns the clobber the call left
+    behind, and nothing else in the function reads it.  Muting that one
+    would print `return r3_2;` with neither an assignment nor a declaration
+    for `r3_2` anywhere, which is worse than the noise it removes.  See
+    :meth:`CGen._return`, which picks exactly these operands.
+    """
+    out = set()
+    for insn in func.insns():
+        if insn.op != Op.RET:
+            continue
+        for s in insn.srcs:
+            if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
+                out.add(s.key())
+                break
+    return out
 
 
 def _lbl(block):
     return "loc_%X" % block.start_ea
 
 
-def _real_uses(func):
+def _real_uses(func, seed=()):
     """
     SSA keys whose value reaches a use that is actually code.
 
@@ -778,8 +915,15 @@ def _real_uses(func):
     *might* read them.  Neither is a phi argument on its own -- it is only a
     real use if the phi's own result is.  Propagating that backwards is what
     separates "this function reads r9" from "r9 was in scope".
+
+    ``seed`` adds keys that count as real for reasons the IR cannot show --
+    a value the renderer will print as a call argument or a return operand.
+    It has to go in here rather than be unioned onto the result, so that the
+    phi propagation carries it backwards too: the `this` pointer a C++ call
+    takes is usually a phi of one clobber per arm, and only the phi's own
+    result appears in the argument list.
     """
-    real = set()
+    real = set(seed)
     consumers = {}          # key -> phis that read it
     for insn in func.insns():
         if insn.op in ABI_OPS:
@@ -930,11 +1074,15 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None):
     sep = "" if ret.endswith("*") else " "
     out.append("%s%s%s(%s)" % (ret, sep, name, params))
     out.append("{")
+    # The body first: `declarations` declares the names it printed, so it has
+    # to run second.
+    info = dict(info, labels=set(info.get("labels", ())))
+    body = []
+    g.emit(stmts, body, 1, info)
     decls = g.declarations()
     if decls:
         out.extend(decls)
         out.append("")
-    info = dict(info, labels=set(info.get("labels", ())))
-    g.emit(stmts, out, 1, info)
+    out.extend(body)
     out.append("}")
     return out

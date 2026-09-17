@@ -48,10 +48,12 @@ def render(f, str_of=None):
     assert not problems, "after opt:\n" + "\n".join(problems)
     stmts, info = structure.structure(f)
     f.structure_info = info
-    return "\n".join(cgen.generate(f, stmts, info,
+    text = "\n".join(cgen.generate(f, stmts, info,
                                    name_of=lambda ea: "sub_%X" % ea,
                                    arity_of=lambda ea: None,
                                    str_of=str_of))
+    audit(text)
+    return text
 
 
 def show(title, text):
@@ -71,6 +73,66 @@ def abi_ret():
     """What a return hands back: memory, the channel chain and r3 onward."""
     return [Var(regs.R_MEM), Var(regs.R_CH)] + \
         [Var(r) for r in range(regs.ARG_FIRST, regs.ARG_FIRST + 4)]
+
+
+def audit(text):
+    """
+    The declaration block and the body must agree about which names exist.
+
+    A name the body mentions but never declares, or declares but never
+    assigns, means the listing refers to a value it does not show being
+    computed.  Both happened: the inlining depth cap used to print a bare name
+    for a definition that had already been suppressed as a statement, and a
+    muted clobber's name still appeared where a call's arguments were
+    rendered.  Every rendered function in this file is checked, so a
+    regression in either direction fails a test rather than quietly producing
+    a listing that does not add up.
+
+    Registers the function only reads are exempt when marked `// live in`:
+    they arrive with a value, so there is nothing to assign.
+    """
+    import re
+    lines = text.splitlines()
+    try:
+        brace = next(i for i, l in enumerate(lines) if l == "{")
+    except StopIteration:
+        return
+    sig = lines[brace - 1] if brace else ""
+    params = set(re.findall(r"\ba\d+\b", sig))
+
+    decl = re.compile(r"^    (?P<type>(?:unsigned |signed |const |vec_\w+ |"
+                      r"char |short |int |long |float |double |bool |"
+                      r"qword\w* |u8 |u16 |u32 |u64 |\w+ )+)\*?\s*"
+                      r"(?P<names>[*\w, ]+);(?:\s*//\s*(?P<note>.*))?$")
+    strlit = re.compile(r'"(?:[^"\\]|\\.)*"')
+    annot = re.compile(r"<[^<>]*>")
+    comment = re.compile(r"//.*$")
+    regname = re.compile(r"\b(r\d+(?:_\d+)?|lr(?:_\d+)?|sp(?:_\d+)?|"
+                         r"gp(?:_\d+)?|fp(?:_\d+)?|ra(?:_\d+)?)\b")
+
+    names, code = {}, []
+    for l in lines[brace + 1:]:
+        m = decl.match(l)
+        if m and " = " not in l and "(" not in l and "goto" not in l:
+            note = m.group("note") or ""
+            for n in m.group("names").split(","):
+                n = n.strip().lstrip("*").strip()
+                if re.fullmatch(r"[A-Za-z_]\w*", n):
+                    names[n] = note
+            continue
+        code.append(annot.sub("", comment.sub("", strlit.sub('""', l))))
+    code = "\n".join(code)
+
+    for n, note in names.items():
+        if "live in" in note:
+            continue
+        assigned = re.search(r"(?:^|[^\w.>])\*?" + re.escape(n)
+                             + r"\s*(?:=[^=]|\+\+|--)", code, re.M)
+        assert assigned, "declared but never assigned: %s\n%s" % (n, text)
+
+    for n in sorted(set(regname.findall(code))):
+        assert n in names or n in params, \
+            "used but never declared: %s\n%s" % (n, text)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +259,45 @@ def test_no_raw_name_of():
     print()
 
 
+def test_deep_inline_chain():
+    """
+    A chain longer than the inlining depth cap must still compute every value.
+
+    ``operand`` only inlines while ``depth < MAX_INLINE_DEPTH``; past that it
+    printed the definition's *name*, while ``insn_stmt`` had already dropped
+    that definition as a statement because it was marked inlinable.  The
+    listing then used a variable it never computed.  :func:`cgen._inlinable`
+    now applies the cap when it picks candidates, so anything too deep stays
+    a statement instead.
+
+    Each link adds a different live-in register, so constant folding cannot
+    collapse the chain and the cap really is reached.  ``audit`` inside
+    :func:`render` is what checks the result; the assertion below states the
+    shape so a silent change stays visible.
+    """
+    R3 = regs.ARG_FIRST
+    n = 2 * cgen.MAX_INLINE_DEPTH
+    t0 = regs.NREG
+    insns = [Insn(Op.MOV, Var(t0), [Var(80)], ea=0x300, scalar=True)]
+    for i in range(n):
+        insns.append(Insn(Op.ADD, Var(t0 + i + 1),
+                          [Var(t0 + i), Var(81 + i)],
+                          ea=0x304 + 4 * i, scalar=True))
+    insns.append(Insn(Op.MOV, Var(R3), [Var(t0 + n)], ea=0x400, scalar=True))
+    insns.append(Insn(Op.RET, None, abi_ret(), ea=0x404))
+    f = build("deep", [(0x300, insns)], [])
+
+    text = render(f)
+    show("deep inline chain (%d links, cap %d)"
+         % (n, cgen.MAX_INLINE_DEPTH), text)
+    body = [l.strip() for l in text.splitlines()
+            if l.startswith("    ") and l.strip().endswith(";")]
+    assert any(l.startswith("t") for l in body), (
+        "expected a temporary to stay a statement:" + chr(10) + text)
+
+
 def main():
+    test_deep_inline_chain()
     test_no_raw_name_of()
     test_phi_constant_assignment()
     test_strings()
