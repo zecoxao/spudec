@@ -66,6 +66,70 @@ def dump(ea, **kw):
     return decompile(ea, **kw).dump()
 
 
+_ARITY_CACHE = {}
+_ARITY_ACTIVE = set()
+_ARITY_CUTS = 0        # cycles cut while answering the current query
+
+
+def clear_arity_cache():
+    """Forget recovered arities -- call after changing function boundaries."""
+    _ARITY_CACHE.clear()
+    _ARITY_ACTIVE.clear()
+    global _ARITY_CUTS
+    _ARITY_CUTS = 0
+
+
+def arity_of(ea):
+    """
+    How many parameters the function at ``ea`` takes, or None if unknown.
+
+    Needed to show a call's arguments: the operand list of a call names every
+    argument register because a callee *might* read them, so only the callee
+    itself can say how many of those are real.
+
+    Demand-driven and recursive: working out one function's arity consults its
+    own callees, so a parameter that is merely forwarded down a chain is still
+    recovered.  Recursion terminates on an in-progress set rather than by
+    caching a placeholder -- caching one would make the answer depend on which
+    function happened to be asked about first.  Memoisation keeps the total
+    work linear in the number of functions.
+
+    The cache is keyed on address, so clear it if function boundaries change.
+    """
+    global _ARITY_CUTS
+    if ea in _ARITY_CACHE:
+        return _ARITY_CACHE[ea]
+    if ea in _ARITY_ACTIVE:
+        # A cycle.  Report "unknown" for this query and record that the answer
+        # now being computed rests on a cut edge.
+        _ARITY_CUTS += 1
+        return None
+
+    cuts_before = _ARITY_CUTS
+    _ARITY_ACTIVE.add(ea)
+    try:
+        import ida_funcs
+        f = ida_funcs.get_func(ea)
+        if f is None or f.start_ea != ea:
+            return None
+        from . import cgen
+        func = decompile(ea, scalarize=False)
+        n = len(cgen._params(func, arity_of))
+    except Exception:
+        return None
+    finally:
+        _ARITY_ACTIVE.discard(ea)
+
+    # Only cache an answer that did not depend on a cut cycle.  A result
+    # computed while some caller up the stack was still in progress is a
+    # *lower bound*, not the answer -- caching it would freeze in whatever
+    # the traversal order happened to produce, and the same function would
+    # then get different signatures depending on what was decompiled first.
+    if _ARITY_CUTS == cuts_before:
+        _ARITY_CACHE[ea] = n
+    return n
+
+
 def structured(func):
     """Structure an already-decompiled function: returns (stmts, info)."""
     from . import structure
@@ -189,7 +253,7 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
     return head + body, stats
 
 
-def pseudocode(ea, name_of=None, **kw):
+def pseudocode(ea, name_of=None, arity=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
@@ -200,4 +264,6 @@ def pseudocode(ea, name_of=None, **kw):
     from . import cgen
     func = ea if isinstance(ea, Function) else decompile(ea, **kw)
     stmts, info = structured(func)
-    return cgen.generate(func, stmts, info, name_of=name_of)
+    if arity is None:
+        arity = arity_of
+    return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity)

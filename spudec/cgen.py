@@ -126,8 +126,16 @@ class Namer(object):
 # ---------------------------------------------------------------------------
 
 
-def _inlinable(func):
-    """Keys of definitions that should print at their use site instead."""
+def _inlinable(func, call_arg_keys=()):
+    """
+    Keys of definitions that should print at their use site instead.
+
+    ``call_arg_keys`` are values that will be rendered as a call's arguments;
+    those may fold into the call even though its operand list is an ABI op,
+    which is what turns three `rN = const` lines plus `memcpy()` into
+    `memcpy(0, 0xC720, 0x20)`.
+    """
+    call_arg_keys = set(call_arg_keys)
     defs, use_count, use_site = {}, {}, {}
     for insn in func.insns():
         d = insn.defines()
@@ -144,10 +152,18 @@ def _inlinable(func):
             continue
         # UNDEF stays a statement of its own: folding "<clobbered by call>"
         # into an expression hides the very thing the reader needs to see.
-        if insn.op in (Op.PHI, Op.CONST, Op.UNDEF) or insn.op.has_side_effects:
+        is_arg = key in call_arg_keys
+        # A constant normally stays its own statement; as a call argument it
+        # reads far better folded in.
+        if insn.op in (Op.PHI, Op.UNDEF) or insn.op.has_side_effects:
+            continue
+        if insn.op == Op.CONST and not is_arg:
             continue
         site = use_site[key]
-        if site.op == Op.PHI or site.op in ABI_OPS:
+        if site.op == Op.PHI:
+            continue
+        if site.op in ABI_OPS and not (is_arg and
+                                       site.op in (Op.CALL, Op.ICALL)):
             continue
         if site.block is not insn.block:
             continue
@@ -171,12 +187,28 @@ def _inlinable(func):
 
 class CGen(object):
 
-    def __init__(self, func, name_of=None):
+    def __init__(self, func, name_of=None, arity_of=None):
         self.func = func
+        self.arity_of = arity_of
+        # Which operands of each call are really its arguments.  Needs the
+        # callee's arity: the operand list names every argument register
+        # because a callee *might* read them, so without knowing how many it
+        # actually takes there is no way to tell arguments from noise.
+        self.call_args = {}
+        if arity_of is not None:
+            for insn in func.insns():
+                if insn.op != Op.CALL or insn.aux is None:
+                    continue
+                n = arity_of(insn.aux)
+                if n:
+                    args = call_arguments(insn, n)
+                    if args:
+                        self.call_args[id(insn)] = args
+
         # Parameters get positional names (a1, a2, ...) the way a real
         # decompiler shows them; the register each one came from goes in the
         # header comment so the mapping back to the disassembly is not lost.
-        self.params = _params(func)
+        self.params = _params(func, arity_of)
         self.param_name = {}
         pnames = {}
         for i, r in enumerate(self.params):
@@ -184,7 +216,15 @@ class CGen(object):
             self.param_name[r] = nm
             pnames[(r, 0)] = nm
         self.namer = Namer(func, pnames)
-        self.inlinable, self.defs = _inlinable(func)
+        # Argument setup may fold into the call now that the call shows its
+        # arguments -- but only for operands that are actually rendered.  A
+        # register set before a call the callee never reads must stay a
+        # visible statement, or the value would vanish from the listing.
+        rendered = set()
+        for args in self.call_args.values():
+            for a in args:
+                rendered.add(a.key())
+        self.inlinable, self.defs = _inlinable(func, rendered)
         self.name_of = name_of or (lambda ea: "sub_%X" % ea)
         self.mute = _muted_clobbers(func)
         self.call_at = {i.ea: i for i in func.insns()
@@ -208,26 +248,32 @@ class CGen(object):
     def const(self, c, scalar):
         return c.scalar_str() if scalar else str(c)
 
-    def operand(self, v, depth=0, scalar=True, top=False):
+    def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False):
         """
         ``top`` means the result already sits in a context that brackets it --
         the inside of a `*(u32 *)(...)`, or the whole right-hand side of an
         assignment -- so an infix expression needs no parentheses of its own.
+
+        ``want_scalar`` says the consuming context reads the preferred slot,
+        so a constant folded in here should be spelled as a scalar even if the
+        lifter could not prove the definition was one.  Call arguments and
+        addresses are both like that.
         """
         if v.is_const:
             return self.const(v, scalar)
         if depth < MAX_INLINE_DEPTH and v.key() in self.inlinable:
-            return self.rhs(self.defs[v.key()], depth + 1, top=top)
+            return self.rhs(self.defs[v.key()], depth + 1, top=top,
+                            want_scalar=want_scalar)
         return self.namer.name(v)
 
     def addr(self, v, depth=0):
         if v.is_const:
             return "0x%X" % (v.val >> 96)
-        return self.operand(v, depth, top=True)
+        return self.operand(v, depth, top=True, want_scalar=True)
 
     # -- right-hand sides --------------------------------------------------
 
-    def rhs(self, insn, depth=0, top=True):
+    def rhs(self, insn, depth=0, top=True, want_scalar=False):
         op = insn.op
         sc = insn.scalar
 
@@ -235,12 +281,15 @@ class CGen(object):
             # A constant assigned to something the types say is a scalar
             # prints as a scalar, even when the lifter could not prove it was
             # one: `0x3e000` rather than `#0x3e000:w4`.
-            if not sc and insn.dst is not None:
-                t = self.type_of(insn.dst)
-                if t is not None and t.kind in (types.INT, types.PTR,
-                                                types.UNK) \
-                        and t.width in (1, 2, 4):
-                    sc = True
+            t = self.type_of(insn.dst) if insn.dst is not None else None
+            if not sc and t is not None and t.kind in (types.INT, types.PTR,
+                                                       types.UNK) \
+                    and t.width in (1, 2, 4):
+                sc = True
+            # A consumer that reads only the preferred slot settles it too,
+            # unless the type positively says this value is a vector.
+            if not sc and want_scalar and (t is None or t.kind != types.VEC):
+                sc = True
             return self.const(insn.srcs[0], sc)
         if op == Op.MOV:
             return self.operand(insn.srcs[0], depth, sc, top=top)
@@ -254,7 +303,12 @@ class CGen(object):
         if op in (Op.CALL, Op.ICALL):
             tgt = (self.name_of(insn.aux) if op == Op.CALL
                    else "(*%s)" % self.operand(insn.srcs[0], depth))
-            return "%s()" % tgt
+            args = self.call_args.get(id(insn))
+            if not args:
+                return "%s()" % tgt
+            return "%s(%s)" % (tgt, ", ".join(
+                self.operand(a, depth, True, top=True, want_scalar=True)
+                for a in args))
         if op == Op.RDCH:
             return "rdch(%s)" % channels.label(insn.aux)
         if op == Op.RCHCNT:
@@ -357,6 +411,8 @@ class CGen(object):
             d = insn.defines()
             if d is None or d.reg in regs.PSEUDO:
                 continue
+            if d.key() in self.inlinable:
+                continue          # printed at its use site, never as a name
             nm = self.namer.name(d)
             if nm in by_name or nm in pnames:
                 continue
@@ -645,7 +701,28 @@ def _real_uses(func):
     return real
 
 
-def _params(func):
+def call_arguments(insn, n):
+    """
+    The first ``n`` argument operands of a call, in ABI order.
+
+    A call carries the whole argument register set in its operand list, so the
+    arguments are picked out by register number rather than by position --
+    that stays correct if the ABI operand set is ever widened or narrowed.
+    """
+    by_reg = {}
+    for s in insn.srcs:
+        if s.is_var and regs.ARG_FIRST <= s.reg <= regs.ARG_LAST:
+            by_reg.setdefault(s.reg, s)
+    out = []
+    for i in range(n):
+        v = by_reg.get(regs.ARG_FIRST + i)
+        if v is None:
+            return None            # operand set does not reach that far
+        out.append(v)
+    return out
+
+
+def _params(func, arity_of=None):
     """
     The function's parameters, as a contiguous list of argument registers.
 
@@ -662,7 +739,22 @@ def _params(func):
     hi = None
     real = _real_uses(func)
     for insn in func.insns():
-        if insn.op in ABI_OPS or insn.op == Op.PHI:
+        if insn.op == Op.PHI:
+            continue
+        if insn.op in ABI_OPS:
+            # A call's operand list names every argument register, so it says
+            # nothing on its own -- *unless* the callee's arity is known, in
+            # which case the operands within that arity really are arguments.
+            # That is what catches a parameter this function only forwards.
+            if arity_of is None or insn.op not in (Op.CALL, Op.ICALL):
+                continue
+            n = arity_of(insn.aux) if insn.op == Op.CALL else None
+            if not n:
+                continue
+            args = call_arguments(insn, n) or []
+            for u in args:
+                if u.ver == 0 and regs.ARG_FIRST <= u.reg <= regs.ARG_LAST:
+                    hi = u.reg if hi is None else max(hi, u.reg)
             continue
         for u in insn.uses():
             if u.ver != 0 or u.key() not in real:
@@ -695,9 +787,9 @@ def _signature(g, func):
     return ret, (", ".join(plist) or "void")
 
 
-def generate(func, stmts, info, name_of=None):
+def generate(func, stmts, info, name_of=None, arity_of=None):
     """Render the structured AST as pseudocode lines."""
-    g = CGen(func, name_of)
+    g = CGen(func, name_of, arity_of)
     name = func.name or "sub_%X" % func.start_ea
     ret, params = _signature(g, func)
 
