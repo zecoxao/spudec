@@ -175,8 +175,141 @@ class Strings(object):
         return body.decode("latin-1")
 
 
-def make(enabled=True):
-    """A resolver, or one that never matches when strings are turned off."""
-    if not enabled:
-        return lambda ea: None
-    return Strings()
+# ---------------------------------------------------------------------------
+# function names
+# ---------------------------------------------------------------------------
+#
+# C++ code compiled for these cores keeps its mangled symbols, and a listing
+# full of `_ZN2ss6cryptoC1ENS_16crypto_algorithmE(...)` is barely readable.
+# IDA can demangle, and `MNG_NODEFINIT` gives exactly the form a call site
+# wants: the qualified name with no parameter list, since the real arguments
+# are printed instead.
+
+# Characters that may appear in a name without making the expression it sits
+# in unreadable.  `~` is a destructor, `::` a scope, `<>,` a template.
+_NAME_OK = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:~<>,")
+
+
+def _sanitise(name):
+    """
+    Make a demangled name safe to drop into an expression.
+
+    Most demangled names already are.  The exceptions are the compiler's own
+    helpers -- "`global constructor keyed to'ss::foo" -- whose backticks,
+    apostrophes and spaces would read as broken syntax in a call.
+    """
+    if all(ch in _NAME_OK for ch in name):
+        return name
+    out = "".join(ch if ch in _NAME_OK else "_" for ch in name)
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_") or name
+
+
+def demangle(name):
+    """The qualified C++ name without its parameter list, or None."""
+    if not name:
+        return None
+    try:
+        import ida_name
+    except ImportError:
+        return None
+    d = ida_name.demangle_name(name, ida_name.MNG_NODEFINIT)
+    if not d or d == name:
+        return None
+    # Defensive: if a parameter list survived, cut it.  `operator()` is the
+    # one name where the parentheses are part of the name itself.
+    if "(" in d and "operator" not in d:
+        d = d.split("(", 1)[0].rstrip()
+    return _sanitise(d)
+
+
+class Names(object):
+    """
+    Function names for the listing: demangled, and never ambiguous.
+
+    Two functions can demangle to one name -- a C++ constructor emits both a
+    complete-object and a base-object body, and they differ only in the
+    mangling -- so a name shared by more than one function keeps its address.
+    Printing one name for two functions would quietly merge them, which is
+    precisely the kind of confident wrongness this decompiler tries not to
+    produce.
+    """
+
+    def __init__(self):
+        self._cache = {}
+        self._shared = None
+        self.demangled = 0
+
+    def _shared_names(self):
+        if self._shared is not None:
+            return self._shared
+        self._shared = set()
+        try:
+            import ida_funcs
+            import ida_name
+        except ImportError:
+            return self._shared
+        seen = {}
+        for i in range(ida_funcs.get_func_qty()):
+            f = ida_funcs.getn_func(i)
+            if f is None:
+                continue
+            d = demangle(ida_name.get_name(f.start_ea))
+            if d:
+                seen[d] = seen.get(d, 0) + 1
+        self._shared = {n for n, c in seen.items() if c > 1}
+        return self._shared
+
+    def __call__(self, ea):
+        if ea in self._cache:
+            return self._cache[ea]
+        raw = None
+        try:
+            import ida_name
+            raw = ida_name.get_name(ea)
+        except ImportError:
+            pass
+        d = demangle(raw)
+        if d:
+            self.demangled += 1
+            out = "%s_%X" % (d, ea) if d in self._shared_names() else d
+        else:
+            out = raw or ("sub_%X" % ea)
+        self._cache[ea] = out
+        return out
+
+
+# ---------------------------------------------------------------------------
+# shared, per-session resolvers
+# ---------------------------------------------------------------------------
+#
+# One of each per session rather than one per function: the same format string
+# and the same callee are referenced from many places, and the whole-database
+# pass asks about every constant and every call in every function, so the
+# caches are what keep the lookups from dominating the run.
+
+_STRINGS = None
+_NAMES = None
+
+
+def strings():
+    global _STRINGS
+    if _STRINGS is None:
+        _STRINGS = Strings()
+    return _STRINGS
+
+
+def names():
+    global _NAMES
+    if _NAMES is None:
+        _NAMES = Names()
+    return _NAMES
+
+
+def clear():
+    """Forget everything -- call after retyping data or renaming functions."""
+    global _STRINGS, _NAMES
+    _STRINGS = None
+    _NAMES = None

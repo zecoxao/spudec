@@ -47,9 +47,35 @@ def _clone(v):
 # ---------------------------------------------------------------------------
 
 
+def _const_value(v, defs):
+    """
+    The constant a phi argument holds, or None.
+
+    Looks *through* the argument to its defining instruction, because
+    :func:`propagate` deliberately never folds a constant into a phi argument
+    -- doing so would delete the definition that prints as the assignment on
+    that path.  So by the time this runs, an argument that is morally a
+    constant is still a Var naming a CONST.
+    """
+    if v.is_const:
+        return v.val
+    d = defs.get(v.key())
+    if d is not None and d.op == Op.CONST and d.srcs and d.srcs[0].is_const:
+        return d.srcs[0].val
+    return None
+
+
 def simplify_phis(func):
     """
     phi(x, x, ...) -> mov x;  phi(c, c, ...) -> const c.
+
+    The second rule has to look through each argument to its definition (see
+    :func:`_const_value`).  It matters more than it looks: when every path
+    into a block sets a register to the *same* literal -- which is what a
+    guarded logging call compiles to, several arms each loading the same
+    format string -- collapsing the phi is what lets the literal reach the
+    call site and print as an argument instead of as a name assigned three
+    blocks earlier.
 
     The rewrite is in place, so a converted phi that was not the last one
     leaves real phis sitting behind a non-phi.  That breaks the invariant that
@@ -59,6 +85,7 @@ def simplify_phis(func):
     phis is safe: a phi's arguments are the values arriving from its
     predecessors, never the result of a sibling instruction in its own block.
     """
+    defs = _defmap(func)
     changed = False
     touched = []
     for b in func.blocks:
@@ -72,12 +99,12 @@ def simplify_phis(func):
                     if not (s.is_var and s.key() == dst.key())]
             if not args:
                 continue
+            vals = [_const_value(s, defs) for s in args]
             first = args[0]
-            if first.is_const:
-                if all(s.is_const and s.val == first.val for s in args):
-                    insn.op, insn.srcs, insn.aux = Op.CONST, [Const(first.val)], None
-                    changed = True
-                    touched.append(b)
+            if vals[0] is not None and all(v == vals[0] for v in vals):
+                insn.op, insn.srcs, insn.aux = Op.CONST, [Const(vals[0])], None
+                changed = True
+                touched.append(b)
             elif all(s.is_var and s.key() == first.key() for s in args):
                 insn.op, insn.srcs, insn.aux = Op.MOV, [_clone(first)], None
                 changed = True

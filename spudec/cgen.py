@@ -140,17 +140,38 @@ class Namer(object):
 # ---------------------------------------------------------------------------
 
 
-def _inlinable(func, call_arg_keys=()):
+def _inlinable(func, call_args=None):
     """
     Keys of definitions that should print at their use site instead.
 
-    ``call_arg_keys`` are values that will be rendered as a call's arguments;
-    those may fold into the call even though its operand list is an ABI op,
-    which is what turns three `rN = const` lines plus `memcpy()` into
-    `memcpy(0, 0xC720, 0x20)`.
+    ``call_args`` maps ``id(call_insn)`` to the operands that call will really
+    render as arguments.  Those may fold into the call even though its operand
+    list is an ABI op, which is what turns three `rN = const` lines plus
+    `memcpy()` into `memcpy(0, 0xC720, 0x20)`.
+
+    Constants get a wider licence than anything else: a literal has no
+    operands, no side effects and nothing that can change underneath it, and
+    SSA dominance guarantees its definition reaches every use.  So it may be
+    printed at the use site even when that sits in another block -- which is
+    exactly where a format string set up before a label ends up:
+
+        r3 = "ERROR: %s(%d) drift is set";
+        loc_28BB8:
+            printf(r3, "sceSblSecureClockSrtcWrite1", 0x241);
+
+    The condition is that *every* use renders it as an argument.  A constant
+    the return statement also names has to keep its assignment, or the listing
+    would use a name it never assigns; so would one passed to a call whose
+    arity is unknown, where the argument list is not printed at all and the
+    setup line is the only evidence the value was ever produced.
     """
-    call_arg_keys = set(call_arg_keys)
-    defs, use_count, use_site = {}, {}, {}
+    call_args = call_args or {}
+    rendered = {}                   # key -> the calls that will print it
+    for cid, args in call_args.items():
+        for a in args:
+            rendered.setdefault(a.key(), set()).add(cid)
+
+    defs, use_count, use_site, use_sites = {}, {}, {}, {}
     for insn in func.insns():
         d = insn.defines()
         if d is not None:
@@ -159,19 +180,21 @@ def _inlinable(func, call_arg_keys=()):
             k = u.key()
             use_count[k] = use_count.get(k, 0) + 1
             use_site[k] = insn
+            use_sites.setdefault(k, []).append(insn)
 
     ok = set()
     for key, insn in defs.items():
-        if use_count.get(key, 0) != 1:
-            continue
+        is_arg = key in rendered
         # UNDEF stays a statement of its own: folding "<clobbered by call>"
         # into an expression hides the very thing the reader needs to see.
-        is_arg = key in call_arg_keys
-        # A constant normally stays its own statement; as a call argument it
-        # reads far better folded in.
         if insn.op in (Op.PHI, Op.UNDEF) or insn.op.has_side_effects:
             continue
-        if insn.op == Op.CONST and not is_arg:
+        if insn.op == Op.CONST:
+            if is_arg and all(id(s) in rendered[key]
+                              for s in use_sites.get(key, ())):
+                ok.add(key)
+            continue
+        if use_count.get(key, 0) != 1:
             continue
         site = use_site[key]
         if site.op == Op.PHI:
@@ -237,11 +260,7 @@ class CGen(object):
         # arguments -- but only for operands that are actually rendered.  A
         # register set before a call the callee never reads must stay a
         # visible statement, or the value would vanish from the listing.
-        rendered = set()
-        for args in self.call_args.values():
-            for a in args:
-                rendered.add(a.key())
-        self.inlinable, self.defs = _inlinable(func, rendered)
+        self.inlinable, self.defs = _inlinable(func, self.call_args)
         self.name_of = name_of or (lambda ea: "sub_%X" % ea)
         self.mute = _muted_clobbers(func)
         self.call_at = {i.ea: i for i in func.insns()

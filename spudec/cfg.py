@@ -14,7 +14,7 @@ import ida_gdl
 
 from .ir import Op, Insn, Function
 from .lifter import Lifter, lift_range
-from . import abi
+from . import abi, data
 
 
 def build(func_ea, drop_hints=True):
@@ -36,7 +36,8 @@ def build(func_ea, drop_hints=True):
         index[blk.id] = len(ranges)
         ranges.append((blk.start_ea, blk.end_ea))
 
-    func = Function(f.start_ea, ida_funcs.get_func_name(f.start_ea) or "")
+    # The demangled name, so the header of a C++ routine reads as one.
+    func = Function(f.start_ea, data.names()(f.start_ea))
     lifter = Lifter(drop_hints=drop_hints)
     irblocks = lift_range(lifter, func, ranges)
 

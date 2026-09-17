@@ -1,0 +1,165 @@
+"""
+Standalone tests for the IDA-free half of the pipeline.
+
+Everything except ``cfg``, ``lifter`` and ``view`` runs without IDA -- SSA
+construction, the optimiser, structuring, type recovery and rendering -- so
+building the IR by hand here exercises most of the decompiler without opening
+a database.
+
+Run with::
+
+    python tests/test_pipeline.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".."))
+
+from spudec.ir import Op, EW, Const, Var, Insn, Function     # noqa: E402
+from spudec import regs, ssa, opt, structure, cgen, data     # noqa: E402
+
+
+def word0(v):
+    """A quadword whose preferred slot holds ``v``."""
+    return (v & 0xFFFFFFFF) << 96
+
+
+def build(name, blocks, edges):
+    f = Function(blocks[0][0], name)
+    for start, insns in blocks:
+        b = f.new_block(start, start + 4 * max(len(insns), 1))
+        for i in insns:
+            b.add(i)
+    for a, b in edges:
+        f.blocks[a].succs.append(f.blocks[b])
+        f.blocks[b].preds.append(f.blocks[a])
+    return f
+
+
+def render(f, str_of=None):
+    ssa.to_ssa(f)
+    problems = ssa.verify(f)
+    assert not problems, "\n".join(problems)
+    f.stats = opt.optimize(f)
+    problems = ssa.verify(f)
+    assert not problems, "after opt:\n" + "\n".join(problems)
+    stmts, info = structure.structure(f)
+    f.structure_info = info
+    return "\n".join(cgen.generate(f, stmts, info,
+                                   name_of=lambda ea: "sub_%X" % ea,
+                                   arity_of=lambda ea: None,
+                                   str_of=str_of))
+
+
+def show(title, text):
+    print("=" * 72)
+    print(title)
+    print("=" * 72)
+    print(text)
+    print()
+
+
+def expect(text, *needles):
+    for n in needles:
+        assert n in text, "expected %r in:\n%s" % (n, text)
+
+
+def abi_ret():
+    """What a return hands back: memory, the channel chain and r3 onward."""
+    return [Var(regs.R_MEM), Var(regs.R_CH)] + \
+        [Var(r) for r in range(regs.ARG_FIRST, regs.ARG_FIRST + 4)]
+
+
+# ---------------------------------------------------------------------------
+# 1. a phi argument that is a constant must keep its assignment
+# ---------------------------------------------------------------------------
+
+
+def test_phi_constant_assignment():
+    """
+    Regression: constant propagation used to fold a constant into a phi
+    argument, which killed the defining instruction and made DCE delete it --
+    so the assignment vanished from the arm of the `if` that performed it and
+    the listing silently dropped a store to a register.
+    """
+    R3, R4 = regs.ARG_FIRST, regs.ARG_FIRST + 1
+    f = build("pick", [
+        (0x100, [
+            Insn(Op.CJMP, None, [Var(R4)], ea=0x100, aux=(0x120, "z")),
+        ]),
+        (0x104, [
+            Insn(Op.CONST, Var(R3), [Const(word0(1))], ea=0x104, scalar=True),
+            Insn(Op.JMP, None, [], ea=0x108, aux=0x130),
+        ]),
+        (0x120, [
+            Insn(Op.CONST, Var(R3), [Const(word0(2))], ea=0x120, scalar=True),
+            Insn(Op.JMP, None, [], ea=0x124, aux=0x130),
+        ]),
+        (0x130, [
+            Insn(Op.RET, None, abi_ret(), ea=0x130),
+        ]),
+    ], [(0, 1), (0, 2), (1, 3), (2, 3)])
+
+    text = render(f)
+    show("1. both arms of a phi keep their assignment", text)
+    # Both constants must survive; before the fix only the branch itself did.
+    expect(text, "= 0x1;", "= 0x2;")
+
+
+# ---------------------------------------------------------------------------
+# 2. a constant that points at a string renders as one
+# ---------------------------------------------------------------------------
+
+
+def test_strings():
+    """
+    The resolver is a callback because answering it needs the database, so
+    here it is a stub: 0x2C018 is a string, nothing else is.
+    """
+    def str_of(ea):
+        return data.escape("INFO: %s\n") if ea == 0x2C018 else None
+
+    R3, R4 = regs.ARG_FIRST, regs.ARG_FIRST + 1
+    f = build("logger", [
+        (0x200, [
+            Insn(Op.CONST, Var(R3), [Const(word0(0x2C018))], ea=0x200,
+                 scalar=True),
+            # A store through the same constant must NOT print the literal.
+            Insn(Op.STORE, Var(regs.R_MEM),
+                 [Var(regs.R_MEM), Const(word0(0x2C018)), Var(R4)],
+                 ew=EW.B, ea=0x204),
+            Insn(Op.RET, None, abi_ret(), ea=0x208),
+        ]),
+    ], [])
+
+    text = render(f, str_of=str_of)
+    show("2. string constants", text)
+    expect(text, '"INFO: %s\\n"')
+    # Typed from the literal, so the declaration agrees with the assignment.
+    expect(text, "char *")
+    # ...but the store destination stays an address: writing through a string
+    # literal would read as an assignment to a constant.
+    expect(text, "*(u8 *)(0x2C018) =")
+
+    # Escaping, and the sniffer's rejections.  The input holds a quote, a
+    # backslash and a tab; all three have to come back out as C escapes.
+    raw = 'a"b' + chr(92) + 'c' + chr(9) + 'd'
+    assert data.escape(raw) == '"a\\"b\\\\c\\td"', data.escape(raw)
+    assert data._looks_like_text(b"hello")
+    assert not data._looks_like_text(b"ab"), "too short"
+    assert not data._looks_like_text(b"    "), "no letter or digit"
+    assert not data._looks_like_text(b"he\x01lo"), "not printable"
+    # No database here, so the resolver itself must simply decline.
+    assert data.Strings()(0x2C018) is None
+
+
+def main():
+    test_phi_constant_assignment()
+    test_strings()
+    print("all tests passed")
+
+
+if __name__ == "__main__":
+    main()

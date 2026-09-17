@@ -153,12 +153,10 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
     Returns ``(lines, stats)``.
     """
     import ida_funcs
-    import ida_name
     import ida_nalt
 
     if name_of is None:
-        def name_of(ea):
-            return ida_name.get_name(ea) or ("sub_%X" % ea)
+        name_of = names()
 
     if funcs is None:
         funcs = sorted(ida_funcs.getn_func(i).start_ea
@@ -232,6 +230,7 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
         % (stats["stores"], stats["loads"], stats["scalars"]),
         "//   strings    : %d constant(s) resolved to string literals"
         % stats["strings"],
+        "//   names      : %d C++ symbol(s) demangled" % names().demangled,
     ]
     if stats["problems"]:
         head.append("//   SSA verifier problems: %d -- the affected functions "
@@ -257,30 +256,28 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
     return head + body, stats
 
 
-_STRINGS = None
-
-
 def strings():
+    """The shared constant-address-to-string-literal resolver (see data.py)."""
+    from . import data
+    return data.strings()
+
+
+def names():
+    """The shared function-name resolver: demangled and unambiguous."""
+    from . import data
+    return data.names()
+
+
+def clear_caches():
     """
-    The shared constant-address-to-string-literal resolver.
+    Forget recovered strings and names.
 
-    One per session rather than one per function: the same format string is
-    referenced from many call sites, and the whole-database pass asks about
-    every constant in every function, so the cache is what keeps the lookups
-    from dominating the run.  Call :func:`clear_strings` after editing string
-    definitions in the database.
+    Call after retyping data or renaming functions in the database; the
+    resolvers cache per session so the whole-database pass stays fast.
     """
-    global _STRINGS
-    if _STRINGS is None:
-        from . import data
-        _STRINGS = data.Strings()
-    return _STRINGS
-
-
-def clear_strings():
-    """Forget recovered strings -- call after retyping data in the database."""
-    global _STRINGS
-    _STRINGS = None
+    from . import data
+    data.clear()
+    clear_arity_cache()
 
 
 def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):
@@ -302,5 +299,7 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):
         arity = arity_of
     if str_of is None:
         str_of = strings()
+    if name_of is None:
+        name_of = names()
     return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity,
                          str_of=str_of)
