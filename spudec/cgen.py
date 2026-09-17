@@ -34,7 +34,7 @@ No IDA imports; pass ``name_of`` to resolve call targets to real symbol names.
 
 from .ir import (Op, EW, OP_NAME, INFIX, MEM_READS, MEM_WRITES, ABI_OPS,
                  EW_SUFFIX)
-from . import regs, channels, types
+from . import regs, channels, types, frame
 from .structure import (Basic, If, Loop, Break, Continue, Goto, Label,
                         Return, Tail)
 
@@ -319,6 +319,11 @@ class CGen(object):
         # name a local rather than something the function only reads.
         self.assigned = set()
         self.mute = _muted_clobbers(func, self._rendered_keys())
+        # The calling convention's own instructions -- saving lr and the
+        # callee-saved registers, writing the back chain -- say nothing about
+        # what this function does.  `generate` states them in the header
+        # instead; see frame.py for what makes a store recognisable as one.
+        self.frame = frame.analyse(func)
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
         # Recover types now rather than earlier in the pipeline: inference has
@@ -779,6 +784,8 @@ class CGen(object):
                 test, self.operand(insn.srcs[1], 0, True))
 
         if op in (Op.STORE, Op.STOREQ):
+            if id(insn) in self.frame.hidden:
+                return None                   # stated in the header instead
             return "%s = %s;" % (
                 self._deref(insn),
                 self.operand(insn.srcs[2], 0, op == Op.STORE, top=True))
@@ -1140,6 +1147,9 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None):
         out.append("// %d constant(s) resolved to string literals"
                    % ts["strings"])
 
+    fr = g.frame.describe()
+    if fr:
+        out.append("// " + fr)
     if g.params:
         out.append("// parameters: %s"
                    % "  ".join("%s = %s" % (g.param_name[r], regs.reg_name(r))

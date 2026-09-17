@@ -358,6 +358,77 @@ def test_callee_demand_narrows_arguments():
 
 
 # ---------------------------------------------------------------------------
+# the calling convention belongs in the header, not in the body
+# ---------------------------------------------------------------------------
+
+
+def test_prologue_moves_to_the_header():
+    """
+    A callee-save store is stated in the header; a slot that is read back is
+    not touched.
+
+    Saving lr and r80..r127 and writing the back chain is a tenth of every
+    line the corpus produces, and none of it says anything about what a
+    function does.  What makes hiding it safe is the third store here: its
+    slot is loaded from later, so it is carrying data whatever it looks like,
+    and it must stay in the body.  The other two are stores of *live-in*
+    callee-saved values, which at entry hold the caller's registers and so
+    can only be being preserved.
+    """
+    from spudec import frame
+    R3 = regs.ARG_FIRST
+    SP, LR = regs.SP, regs.LR
+    t = regs.NREG
+    M = regs.R_MEM
+    MASK = Const(word0(0x3FFF0))
+
+    def slot(tmp, off):
+        """`(sp + off) & ~0xF`, the address shape the lifter emits."""
+        return [Insn(Op.ADD, Var(tmp), [Var(SP), Const(word0(off))],
+                     ew=EW.W, ea=0x100),
+                Insn(Op.AND, Var(tmp + 1), [Var(tmp), MASK], ew=EW.W,
+                     ea=0x104)]
+
+    insns = []
+    insns += slot(t, -0x10)
+    insns.append(Insn(Op.STOREQ, Var(M), [Var(M), Var(t + 1), Var(80)],
+                      ew=EW.Q, ea=0x108))
+    insns += slot(t + 2, 0x10)
+    insns.append(Insn(Op.STOREQ, Var(M), [Var(M), Var(t + 3), Var(LR)],
+                      ew=EW.Q, ea=0x10C))
+    # A slot that is read back: data, not a save.
+    insns += slot(t + 4, -0x30)
+    insns.append(Insn(Op.STOREQ, Var(M), [Var(M), Var(t + 5), Var(81)],
+                      ew=EW.Q, ea=0x110))
+    insns += slot(t + 6, -0x30)
+    insns.append(Insn(Op.LOADQ, Var(R3), [Var(M), Var(t + 7)], ew=EW.Q,
+                      ea=0x114))
+    insns.append(Insn(Op.RET, None, abi_ret(), ea=0x118))
+    f = build("framed", [(0x100, insns)], [])
+
+    ssa.to_ssa(f)
+    fr = frame.analyse(f)
+    assert sorted(r for _, r in fr.saves) == [LR, 80], \
+        "expected lr and r80 to be recognised, got %r" % (fr.saves,)
+    assert 81 not in [r for _, r in fr.saves], \
+        "a slot that is read back is data, not a save"
+
+    text = render(f)
+    show("prologue stated in the header", text)
+    expect(text, "// prologue: saves lr at sp+0x10, r80 at sp-0x10")
+    assert "= r80;" not in text, "the r80 save should not be in the body"
+    assert "= lr;" not in text, "the lr save should not be in the body"
+    expect(text, "= r81;")          # ...but the one that is read back is
+
+    # A register whose only appearance was the save must not be left
+    # declared, or the listing declares a value it never mentions again.
+    # `audit`, inside `render`, checks the general case; this states the one
+    # the frame pass creates.
+    body = text.split(chr(10) + "{" + chr(10), 1)[1]
+    assert "r80" not in body, "r80 is still declared:" + chr(10) + text
+
+
+# ---------------------------------------------------------------------------
 # every mnemonic IDA decodes must have a real semantic, not an intrinsic
 # ---------------------------------------------------------------------------
 
