@@ -11,6 +11,7 @@ Run with::
     python tests/test_pipeline.py
 """
 
+import io
 import os
 import sys
 
@@ -155,7 +156,49 @@ def test_strings():
     assert data.Strings()(0x2C018) is None
 
 
+# ---------------------------------------------------------------------------
+# nothing may quietly bypass the demangling name resolver
+# ---------------------------------------------------------------------------
+
+
+def test_no_raw_name_of():
+    """
+    Regression: the viewer and the plugin each passed their own
+    ``name_of=lambda ea: ida_name.get_name(ea) or "sub_%X" % ea``.  That is an
+    *override*, so teaching the default resolver to demangle changed nothing
+    for either of the two paths a user actually goes through -- the listing
+    still showed ``_ZN2ss14ss_iso_dprintf5put_sEPKc(...)`` while the headless
+    API showed ``ss::ss_iso_dprintf::put_s(...)``.
+
+    A default that every real caller overrides is not a default, so this walks
+    the source and fails if anything hands a bare ``get_name`` back as a name
+    resolver again.
+    """
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.join(here, "..")
+    pattern = re.compile(r"name_of\s*=\s*(.*)")
+    bad = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in ("__pycache__", ".git", "tests")]
+        for fn in sorted(filenames):
+            if not fn.endswith(".py"):
+                continue
+            src = io.open(os.path.join(dirpath, fn), encoding="utf-8",
+                          errors="replace").read()
+            for m in pattern.finditer(src):
+                rhs = m.group(1)
+                if "get_name" in rhs:
+                    bad.append("%s: name_of=%s" % (fn, rhs.strip()[:60]))
+    assert not bad, ("these bypass the demangling resolver:\n  "
+                     + "\n  ".join(bad))
+    print("nothing bypasses the name resolver: ok")
+    print()
+
+
 def main():
+    test_no_raw_name_of()
     test_phi_constant_assignment()
     test_strings()
     print("all tests passed")

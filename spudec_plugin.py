@@ -21,7 +21,6 @@ import ida_idaapi
 import ida_idp
 import ida_kernwin
 import ida_funcs
-import ida_name
 import idaapi
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +47,15 @@ def _check_spu():
 
 
 def _name_of(ea):
-    return ida_name.get_name(ea) or ("sub_%X" % ea)
+    """
+    The name a call site should print.
+
+    Delegates to the package's shared resolver so C++ symbols are demangled
+    here too; returning a bare `get_name()` would override the default and
+    silently undo the demangling for the whole listing.
+    """
+    import spudec
+    return spudec.names()(ea)
 
 
 # ---------------------------------------------------------------------------

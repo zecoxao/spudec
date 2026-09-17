@@ -57,10 +57,10 @@ class IRViewer(ida_kernwin.simplecustviewer_t):
         self._add(_c("; press i for the SSA IR this was rendered from",
                      ida_lines.SCOLOR_AUTOCMT))
         try:
-            import ida_name
-            lines = spudec.pseudocode(
-                func, name_of=lambda ea: ida_name.get_name(ea) or
-                ("sub_%X" % ea))
+            # No name_of here: the default resolver demangles C++ symbols
+            # and keeps them unambiguous, and passing a plain get_name()
+            # lambda would quietly switch that off for the viewer.
+            lines = spudec.pseudocode(func)
         except Exception:
             import traceback
             for ln in traceback.format_exc().splitlines():
