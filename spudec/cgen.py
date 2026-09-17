@@ -49,9 +49,10 @@ MAX_INLINE_DEPTH = 4
 
 class Namer(object):
 
-    def __init__(self, func):
+    def __init__(self, func, param_names=None):
         self._parent = {}
         self._name = {}
+        self._fixed = dict(param_names or {})
         self._build(func)
 
     def _find(self, k):
@@ -100,11 +101,20 @@ class Namer(object):
 
         seen = {}
         for root in sorted(webs, key=lambda r: (r[0], r[1])):
+            members = webs[root]
+            # A web containing the function's incoming value for an argument
+            # register is that parameter, and takes its positional name.
+            fixed = next((self._fixed[k] for k in sorted(members)
+                          if k in self._fixed), None)
+            if fixed is not None:
+                for k in members:
+                    self._name[k] = fixed
+                continue
             base = regs.reg_name(root[0])
             n = seen.get(base, 0) + 1
             seen[base] = n
             nm = base if n == 1 else "%s_%d" % (base, n)
-            for k in webs[root]:
+            for k in members:
                 self._name[k] = nm
 
     def name(self, var):
@@ -163,7 +173,17 @@ class CGen(object):
 
     def __init__(self, func, name_of=None):
         self.func = func
-        self.namer = Namer(func)
+        # Parameters get positional names (a1, a2, ...) the way a real
+        # decompiler shows them; the register each one came from goes in the
+        # header comment so the mapping back to the disassembly is not lost.
+        self.params = _params(func)
+        self.param_name = {}
+        pnames = {}
+        for i, r in enumerate(self.params):
+            nm = "a%d" % (i + 1)
+            self.param_name[r] = nm
+            pnames[(r, 0)] = nm
+        self.namer = Namer(func, pnames)
         self.inlinable, self.defs = _inlinable(func)
         self.name_of = name_of or (lambda ea: "sub_%X" % ea)
         self.mute = _muted_clobbers(func)
@@ -327,14 +347,18 @@ class CGen(object):
         """
         if self.types is None:
             return []
-        params = set(_params(self.func))
+        # Exclude by *name*, not by register number: a register can be both an
+        # argument and a local, because the incoming value is one web and
+        # anything the function writes to that register later is another.
+        # Only the incoming web is the parameter.
+        pnames = set(self.param_name.values())
         by_name = {}
         for insn in self.func.insns():
             d = insn.defines()
             if d is None or d.reg in regs.PSEUDO:
                 continue
             nm = self.namer.name(d)
-            if nm in by_name or d.reg in params:
+            if nm in by_name or nm in pnames:
                 continue
             by_name[nm] = self.ctype(self.type_of(d))
 
@@ -347,11 +371,12 @@ class CGen(object):
             if insn.op in ABI_OPS:
                 continue
             for u in insn.uses():
-                if u.ver != 0 or u.reg in regs.PSEUDO or u.reg in params:
+                if u.ver != 0 or u.reg in regs.PSEUDO:
                     continue
                 nm = self.namer.name(u)
-                if nm not in by_name and nm not in live_in:
-                    live_in[nm] = self.ctype(self.type_of(u))
+                if nm in pnames or nm in by_name or nm in live_in:
+                    continue
+                live_in[nm] = self.ctype(self.type_of(u))
 
         if not by_name and not live_in:
             return []
@@ -582,24 +607,79 @@ def _lbl(block):
     return "loc_%X" % block.start_ea
 
 
-def _params(func):
-    """Argument registers read before being written anywhere in the function."""
-    live_in = set()
+def _real_uses(func):
+    """
+    SSA keys whose value reaches a use that is actually code.
+
+    A use inside a call or return's ABI operand list is not evidence of
+    anything: those lists name every argument register because a callee
+    *might* read them.  Neither is a phi argument on its own -- it is only a
+    real use if the phi's own result is.  Propagating that backwards is what
+    separates "this function reads r9" from "r9 was in scope".
+    """
+    real = set()
+    consumers = {}          # key -> phis that read it
     for insn in func.insns():
         if insn.op in ABI_OPS:
             continue
         for u in insn.uses():
-            if u.ver == 0 and regs.ARG_FIRST <= u.reg <= regs.ARG_FIRST + 7:
-                live_in.add(u.reg)
-    return sorted(live_in)
+            if insn.op == Op.PHI:
+                consumers.setdefault(u.key(), []).append(insn)
+            else:
+                real.add(u.key())
+
+    # A phi result being real makes its arguments real, transitively.
+    changed = True
+    while changed:
+        changed = False
+        for insn in func.insns():
+            if insn.op != Op.PHI:
+                continue
+            d = insn.defines()
+            if d is None or d.key() not in real:
+                continue
+            for u in insn.uses():
+                if u.key() not in real:
+                    real.add(u.key())
+                    changed = True
+    return real
+
+
+def _params(func):
+    """
+    The function's parameters, as a contiguous list of argument registers.
+
+    The SPU ABI is positional: r3 is the first argument, r4 the second, and so
+    on.  So a function that reads r6 has at least four parameters whether or
+    not it ever looks at the first three -- an unused parameter is perfectly
+    ordinary.  Taking only the registers that happen to be read produced
+    signatures like `sub_0(qword r6)`, which cannot be what the function looks
+    like from the caller's side.
+
+    Arity therefore comes from the *highest* argument register with a real
+    use, and every register below it is a parameter too.
+    """
+    hi = None
+    real = _real_uses(func)
+    for insn in func.insns():
+        if insn.op in ABI_OPS or insn.op == Op.PHI:
+            continue
+        for u in insn.uses():
+            if u.ver != 0 or u.key() not in real:
+                continue
+            if regs.ARG_FIRST <= u.reg <= regs.ARG_LAST:
+                hi = u.reg if hi is None else max(hi, u.reg)
+    if hi is None:
+        return []
+    return list(range(regs.ARG_FIRST, hi + 1))
 
 
 def _signature(g, func):
     """Return type and parameter list, from the recovered types."""
     plist = []
-    for r in _params(func):
+    for r in g.params:
         ty = g.types.of((r, 0)) if g.types is not None else None
-        nm = regs.reg_name(r)
+        nm = g.param_name[r]
         ct = g.ctype(ty)
         plist.append("%s%s%s" % (ct, "" if ct.endswith("*") else " ", nm))
 
@@ -642,6 +722,10 @@ def generate(func, stmts, info, name_of=None):
             line += "  (%d contradictory -- suspect)" % ts["contradictions"]
         out.append(line)
 
+    if g.params:
+        out.append("// parameters: %s"
+                   % "  ".join("%s = %s" % (g.param_name[r], regs.reg_name(r))
+                               for r in g.params))
     sep = "" if ret.endswith("*") else " "
     out.append("%s%s%s(%s)" % (ret, sep, name, params))
     out.append("{")

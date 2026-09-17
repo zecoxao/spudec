@@ -380,6 +380,40 @@ conflict at all: "the whole quadword is used" and "the preferred slot holds an
 address" are routinely both true. Narrowing the rule to float-versus-pointer
 took it to zero, leaving 11 genuinely ambiguous signedness cases.
 
+### Parameters
+
+The SPU ABI is positional — r3 is the first argument, r4 the second, and so on
+— so arity comes from the *highest* argument register with a real use, and
+every register below it is a parameter whether or not the function reads it.
+An unused parameter is ordinary; taking only the registers actually read gave
+signatures like `sub_0(qword r6)`, which cannot be what the caller sees.
+
+Parameters print positionally (`a1`, `a2`, …) the way a real decompiler shows
+them, with the register each came from in a header comment so nothing is lost:
+
+```c
+// parameters: a1 = r3  a2 = r4  a3 = r5
+vec_uchar16 lv0::signed_elf::check_extended_header(qword a1, unsigned int a2,
+                                                   vec_uint4 a3)
+```
+
+**What counts as a real use** is the whole difficulty. A use inside a call or
+return's ABI operand list proves nothing: those lists name every argument
+register because a callee *might* read them. Neither does a phi argument on its
+own — it is only real if the phi's result is, which has to be propagated
+backwards. Without that filter, `check_manu_revoked_version(void)` came out
+with eight parameters because r9 and r10 were merely in scope across a call.
+
+Measured against the 95 mangled C++ names in metldr, which state the true
+prototype (and `this` for member functions): **75 exact, 19 under, 1 over.**
+The under-counts are parameters a function only forwards to another call, whose
+sole use is therefore an ABI list. Closing that needs the callee's arity —
+an interprocedural fixpoint this per-function pipeline does not do. Erring
+low is the safe direction: it shows fewer parameters than exist rather than
+inventing ones, and nothing in the body is hidden either way.
+
+### Everything else
+
 Output gains a declarations block, a typed signature, `*p` instead of
 `*(u32 *)(p)` where the pointer type is known, and scalar-spelled constants.
 Registers the function reads but never writes, outside the range the ABI calls
@@ -519,6 +553,10 @@ reads as one range rather than 339 — without that the corpus figure reads
   the viewer) is the ground truth if a rendering ever looks wrong.
 - Type recovery stops at scalars, pointers and vectors. No structs, no arrays,
   no typedefs: `p->field` and `a[i]` still read as pointer arithmetic.
+- Parameter recovery is per-function, so a parameter that is only forwarded to
+  another call is missed (19 of 95 on metldr). Fixing it properly means
+  computing arity for the whole program to a fixpoint, so a call site can be
+  told how many of its argument registers the callee actually reads.
 - Switch dispatch is resolved only for the GCC jump-table idiom the patched
   `spu.py` matches. Other shapes still arrive as unreachable blocks; they are
   reported, not decompiled.
