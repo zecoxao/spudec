@@ -5,11 +5,14 @@ Double-click (or Enter) on a line jumps the disassembly to the address that
 line was lifted from, so the IR stays anchored to what IDA shows.
 """
 
+import re
+
 import ida_kernwin
 import ida_lines
 import idaapi
 
 from .ir import Op
+from . import highlight
 
 
 def _c(text, color):
@@ -64,11 +67,10 @@ class IRViewer(ida_kernwin.simplecustviewer_t):
                 self._add(_c("; " + ln, ida_lines.SCOLOR_ERROR))
             return
         for ln in lines:
-            ea = None
-            if ln.startswith("//"):
-                self._add(_c(ln, ida_lines.SCOLOR_AUTOCMT), func.start_ea)
-                continue
-            self._add(_colour_c(ln), ea)
+            # The header comments carry the function address so a double-click
+            # anywhere in them still navigates.
+            self._add(_colour_c(ln),
+                      func.start_ea if ln.startswith("//") else None)
 
     def _add(self, text, ea=None):
         self.AddLine(text)
@@ -162,21 +164,8 @@ class IRViewer(ida_kernwin.simplecustviewer_t):
         return False
 
 
-_C_KEYWORDS = ("if ", "else", "while ", "do", "for ", "return", "break;",
-               "continue;", "goto ")
-
-
 def _colour_c(line):
-    stripped = line.strip()
-    if stripped.startswith("//"):
-        return _c(line, ida_lines.SCOLOR_AUTOCMT)
-    if stripped.startswith(_C_KEYWORDS) or stripped.startswith("} while"):
-        return _c(line, ida_lines.SCOLOR_KEYWORD)
-    if stripped.startswith("*(") or " = *(" in stripped:
-        return _c(line, ida_lines.SCOLOR_DREF)
-    if stripped.endswith(":"):
-        return _c(line, ida_lines.SCOLOR_CREFTAIL)
-    return line
+    return highlight.colorize(line)
 
 
 def show(func, mode="c"):
@@ -232,7 +221,6 @@ class ListingViewer(ida_kernwin.simplecustviewer_t):
         return False
 
 
-import re
 _HEADER_EA = re.compile(r"@\s*0x([0-9A-Fa-f]+)")
 
 

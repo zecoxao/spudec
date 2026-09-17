@@ -36,6 +36,20 @@ Copy `spudec_plugin.py` **and** the `spudec/` directory side by side into:
 | <kbd>i</kbd> (in the viewer) | toggle pseudocode / the SSA IR it came from |
 | double-click | jump the disassembly to that line's address |
 
+Both viewers syntax-highlight the C (`highlight.py`), token by token rather
+than line by line — a line like
+
+```c
+r4 = *(unsigned int *)(r5 + 0x10);   // was lqd/rotqby
+```
+
+has a type, a variable, a number and a comment in it, and colouring the whole
+thing one colour tells the reader nothing. Colours are IDA's own `SCOLOR_*`
+tags rather than fixed RGB, so the output follows whatever theme is set instead
+of turning black-on-black in a dark one. Verified over the whole metldr
+listing: 11859 lines, every one balanced and byte-identical after
+`tag_remove`.
+
 <kbd>Ctrl-F5</kbd> mirrors Hex-Rays' "Decompile all": every function into one
 listing, with a progress box you can cancel (a cancelled run still returns
 what it produced), then a prompt to save it as a `.c` file. Past 60k lines it
@@ -367,7 +381,11 @@ address" are routinely both true. Narrowing the rule to float-versus-pointer
 took it to zero, leaving 11 genuinely ambiguous signedness cases.
 
 Output gains a declarations block, a typed signature, `*p` instead of
-`*(u32 *)(p)` where the pointer type is known, and scalar-spelled constants:
+`*(u32 *)(p)` where the pointer type is known, and scalar-spelled constants.
+Registers the function reads but never writes, outside the range the ABI calls
+arguments, are declared too and marked `// live in` — otherwise the listing
+would use names it never declares. And each name in a pointer group carries its
+own star, since `T *a, b;` makes only `a` a pointer:
 
 ```c
 void __vector_Reset(void)

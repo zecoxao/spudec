@@ -338,19 +338,37 @@ class CGen(object):
                 continue
             by_name[nm] = self.ctype(self.type_of(d))
 
-        if not by_name:
+        # Registers the function reads but never writes, outside the range the
+        # ABI calls arguments.  They are genuine inputs -- callee-saved
+        # registers a caller left set up, say -- and leaving them out would
+        # mean the listing uses names it never declares.
+        live_in = {}
+        for insn in self.func.insns():
+            if insn.op in ABI_OPS:
+                continue
+            for u in insn.uses():
+                if u.ver != 0 or u.reg in regs.PSEUDO or u.reg in params:
+                    continue
+                nm = self.namer.name(u)
+                if nm not in by_name and nm not in live_in:
+                    live_in[nm] = self.ctype(self.type_of(u))
+
+        if not by_name and not live_in:
             return []
         groups = {}
         for nm, ct in by_name.items():
             groups.setdefault(ct, []).append(nm)
 
         out = []
+        if live_in:
+            ins = {}
+            for nm, ct in live_in.items():
+                ins.setdefault(ct, []).append(nm)
+            for ct in sorted(ins):
+                out.extend(_decl_lines(ct, sorted(ins[ct]),
+                                       "   // live in"))
         for ct in sorted(groups):
-            names = sorted(groups[ct])
-            sep = "" if ct.endswith("*") else " "
-            while names:
-                chunk, names = names[:8], names[8:]
-                out.append("    %s%s%s;" % (ct, sep, ", ".join(chunk)))
+            out.extend(_decl_lines(ct, sorted(groups[ct])))
         return out
 
     # -- statements --------------------------------------------------------
@@ -518,6 +536,26 @@ _EW_CALLS = frozenset((
     Op.FADD, Op.FSUB, Op.FMUL, Op.FMA, Op.FMS, Op.FNMS, Op.FNMA,
     Op.FCMPEQ, Op.FCMPGT, Op.FCMPMEQ, Op.FCMPMGT,
 ))
+
+def _decl_lines(ctype, names, suffix=""):
+    """
+    One or more declaration lines for ``names`` of type ``ctype``.
+
+    In C the `*` binds to the declarator, not the type: `T *a, b;` makes only
+    `a` a pointer.  So every name in a pointer group carries its own star.
+    """
+    if ctype.endswith("*"):
+        base = ctype[:-1].rstrip()
+        names = ["*" + n for n in names]
+    else:
+        base = ctype
+    out = []
+    names = list(names)
+    while names:
+        chunk, names = names[:8], names[8:]
+        out.append("    %s %s;%s" % (base, ", ".join(chunk), suffix))
+    return out
+
 
 def _muted_clobbers(func):
     """
