@@ -483,6 +483,21 @@ def mark_scalars(func, demand):
     return n
 
 
+def _callee():
+    """
+    The cross-procedural demand hook, or None outside a database.
+
+    Imported lazily and defensively: scalarisation runs during
+    :func:`spudec.decompile`, which :func:`spudec.param_demand` itself calls,
+    and a unit test may have no database at all.
+    """
+    try:
+        from . import param_demand
+    except ImportError:
+        return None
+    return param_demand
+
+
 def scalarize(func, strict=False):
     """
     Run the whole scalarisation pipeline.  Returns a stats dict.
@@ -503,13 +518,13 @@ def scalarize(func, strict=False):
     stats["stores"], stats["assumed_noalias"] = recover_stores(
         func, strict=strict)
 
-    demand = lanes.compute_demand(func)
+    demand = lanes.compute_demand(func, callee=_callee())
     stats["loads"] = recover_loads(func, demand)
 
-    demand = lanes.compute_demand(func)
+    demand = lanes.compute_demand(func, callee=_callee())
     stats["aligned_loads"] = recover_aligned_loads(func, demand)
 
-    demand = lanes.compute_demand(func)
+    demand = lanes.compute_demand(func, callee=_callee())
     stats["scalars"] = mark_scalars(func, demand)
     func.demand = demand
     return stats

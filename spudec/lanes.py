@@ -105,10 +105,73 @@ def _const_of(v, defs):
     return None
 
 
-def _contrib(insn, out_mask, defs):
+def _abi_contrib(insn, n, callee):
+    """
+    Demand contributed by a call, return or indirect branch to its operands.
+
+    These carry the whole ABI register set so that dead-code elimination
+    cannot delete argument setup, which means the operand list is mostly
+    filler.  Crediting all of it with ALL was the single biggest source of
+    imprecision in this analysis: it is what made an `a rX, sp, 0x20`
+    computing an argument unscalarisable, and then propagated that back into
+    the stack pointer.
+
+    ``callee(ea)`` -- when supplied -- answers what the function at ``ea``
+    demands of each of its parameter registers.  Without it, or for anything
+    indirect, every argument register stays ALL.
+    """
+    from . import regs
+    out = []
+    masks = None
+    if callee is not None and insn.op == Op.CALL and insn.aux is not None:
+        masks = callee(insn.aux)
+    real = ABI_OPS.get(insn.op, 0)
+    for i, src in enumerate(insn.srcs):
+        if i < real:
+            # An indirect branch or call's leading operand is its target,
+            # which the hardware reads out of the preferred slot.
+            out.append(W0)
+            continue
+        if not src.is_var:
+            out.append(NONE)
+            continue
+        r = src.reg
+        if r in regs.PSEUDO:
+            # Memory and the channel chain have no lanes, so any mask is
+            # meaningless for them -- but NONE is a subset of the preferred
+            # slot, and `mark_scalars` would then call a quadword store
+            # scalar.  Leave them wide.
+            out.append(ALL)
+        elif r == regs.LR:
+            out.append(W0)                # a return address
+        elif insn.op == Op.RET:
+            # Every register in the set really might carry part of a large
+            # return value -- the ABI returns up to 128 bytes in r3 onward --
+            # and what the caller does with it is not visible from here.  So
+            # a return stays wide.  Narrowing it measurably sharpens the
+            # analysis, but `scalarize` *rewrites* load and store idioms from
+            # these masks, so an under-demanded return register would not
+            # merely print oddly: it could turn a quadword access into a
+            # narrow one.  Wrong in that direction is not worth 28 fewer lane
+            # calls.
+            out.append(ALL)
+        elif masks is not None:
+            # A register the callee's answer does not mention is not one of
+            # its parameters at all; default wide rather than narrow, because
+            # narrow is the direction that can claim too much.
+            out.append(masks.get(r, ALL))
+        else:
+            out.append(ALL)
+    return out
+
+
+def _contrib(insn, out_mask, defs, callee=None):
     """
     Demand contributed to each source of ``insn``, given ``out_mask`` on its
     result.  Returns a list parallel to ``insn.srcs``.
+
+    ``callee`` is the cross-procedural hook described in
+    :func:`_abi_contrib`; None keeps every call argument at ALL.
     """
     op = insn.op
     n = len(insn.srcs)
@@ -116,7 +179,7 @@ def _contrib(insn, out_mask, defs):
     # Terminators and side-effecting ops read their operands regardless of
     # whether anything reads a result.
     if op in ABI_OPS:
-        return [ALL] * n
+        return _abi_contrib(insn, n, callee)
     if op == Op.CJMP:
         kind = insn.aux[1] if insn.aux else "z"
         return [H0 if kind in ("hz", "hnz") else W0]
@@ -192,10 +255,14 @@ def _contrib(insn, out_mask, defs):
     return [ALL] * n
 
 
-def compute_demand(func):
+def compute_demand(func, callee=None):
     """
     Returns ``{(reg, ver): mask}`` -- for each SSA value, which of its bytes
     are read.  Values absent from the map are read by nothing.
+
+    ``callee(ea)`` optionally answers what the function at ``ea`` demands of
+    each parameter register, which is what keeps a call's conservative operand
+    list from flooding the analysis; see :func:`_abi_contrib`.
     """
     defs = {}
     for i in func.insns():
@@ -214,7 +281,8 @@ def compute_demand(func):
         for insn in order:
             d = insn.defines()
             out = demand.get(d.key(), NONE) if d is not None else NONE
-            for src, add in zip(insn.srcs, _contrib(insn, out, defs)):
+            for src, add in zip(insn.srcs,
+                                _contrib(insn, out, defs, callee)):
                 if not src.is_var or add == NONE:
                     continue
                 k = src.key()

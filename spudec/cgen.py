@@ -329,7 +329,8 @@ class CGen(object):
             from . import lanes
             demand = getattr(func, "demand", None)
             if demand is None:
-                demand = lanes.compute_demand(func)
+                from . import param_demand
+                demand = lanes.compute_demand(func, callee=param_demand)
             self.types, stats = types.infer(
                 func, demand, self.namer.webs(),
                 is_string=lambda val: self.str_of(val >> 96) is not None)
@@ -498,6 +499,18 @@ class CGen(object):
         #     lane is all there is, and `sp - 0x13B0` says what `add.w(sp,
         #     #0xffffec50:w4)` says, only legibly.  Stack-frame arithmetic is
         #     the commonest arithmetic in this code, and it all lands here.
+        #
+        # The third case is the weakest of the three and worth being explicit
+        # about.  A PTR type comes from a real use as a load or store address,
+        # which reads the preferred slot -- but the same register can *also*
+        # have a genuinely wide use, and the SPU ABI hands it one: the
+        # prologue stores the old stack pointer as a full-quadword back
+        # chain.  Demand then stays ALL while the type still says address, and
+        # no single spelling of the definition is right for both consumers.
+        # The address reading is the one a reader of stack arithmetic wants,
+        # so that is what this prints.  With the cross-procedural demand in
+        # place the first case already covers most of it; this catches the
+        # remainder (117 `add.w` calls in a 264-function module).
         if not sc and op in INFIX and len(insn.srcs) == 2 and insn.ew != EW.Q:
             d = insn.defines()
             t = self.type_of(d) if d is not None else None

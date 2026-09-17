@@ -53,7 +53,8 @@ def decompile(ea, optimize_ir=True, scalarize=True, drop_hints=True,
             # Marking is cheap and the demand masks sharpen once the dead
             # idiom remnants are gone.
             from . import lanes
-            func.demand = lanes.compute_demand(func)
+            func.demand = lanes.compute_demand(func,
+                                               callee=param_demand)
             func.scalar_stats["scalars"] = _scalarize.mark_scalars(
                 func, func.demand)
     func.unhandled = dict(lifter.unhandled)
@@ -128,6 +129,56 @@ def arity_of(ea):
     if _ARITY_CUTS == cuts_before:
         _ARITY_CACHE[ea] = n
     return n
+
+
+_PARAM_DEMAND_CACHE = {}
+_PARAM_DEMAND_ACTIVE = set()
+
+
+def clear_param_demand():
+    """Forget recovered parameter demand -- after boundaries change."""
+    _PARAM_DEMAND_CACHE.clear()
+    _PARAM_DEMAND_ACTIVE.clear()
+
+
+def param_demand(ea):
+    """
+    What the function at ``ea`` reads of each of its parameter registers.
+
+    ``{reg: byte mask}``, the mask being the same 16-bit lane mask
+    :mod:`lanes` uses.  This is what stops a call's conservative operand list
+    from telling the demand analysis that every argument register is read
+    whole; see :func:`lanes._abi_contrib`.
+
+    Demand-driven and recursive, like :func:`arity_of`: working out what one
+    function reads of a parameter consults its own callees, so a parameter
+    merely forwarded down a chain is resolved.  A cycle, an unresolvable
+    address, or any failure answers ALL for every register -- the direction
+    that cannot make the output claim more than it knows.
+    """
+    from . import lanes, regs
+    wide = {r: lanes.ALL for r in range(regs.ARG_FIRST, regs.ARG_LAST + 1)}
+    if ea in _PARAM_DEMAND_CACHE:
+        return _PARAM_DEMAND_CACHE[ea]
+    if ea in _PARAM_DEMAND_ACTIVE:
+        return wide                      # a cycle: stay conservative
+    _PARAM_DEMAND_ACTIVE.add(ea)
+    try:
+        import ida_funcs
+        f = ida_funcs.get_func(ea)
+        if f is None or f.start_ea != ea:
+            return wide
+        func = decompile(ea, scalarize=False)
+        dem = lanes.compute_demand(func, callee=param_demand)
+        out = {}
+        for r in range(regs.ARG_FIRST, regs.ARG_LAST + 1):
+            out[r] = dem.get((r, 0), lanes.NONE)
+    except Exception:
+        return wide
+    finally:
+        _PARAM_DEMAND_ACTIVE.discard(ea)
+    _PARAM_DEMAND_CACHE[ea] = out
+    return out
 
 
 def structured(func):
@@ -278,6 +329,7 @@ def clear_caches():
     from . import data
     data.clear()
     clear_arity_cache()
+    clear_param_demand()
 
 
 def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):

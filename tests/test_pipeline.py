@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 ".."))
 
 from spudec.ir import Op, EW, Const, Var, Insn, Function     # noqa: E402
-from spudec import regs, ssa, opt, structure, cgen, data     # noqa: E402
+from spudec import regs, ssa, opt, structure, cgen, data, lanes     # noqa: E402
 
 
 def word0(v):
@@ -294,6 +294,67 @@ def test_deep_inline_chain():
             if l.startswith("    ") and l.strip().endswith(";")]
     assert any(l.startswith("t") for l in body), (
         "expected a temporary to stay a statement:" + chr(10) + text)
+
+
+def test_callee_demand_narrows_arguments():
+    """
+    A call argument's demand is what the callee reads, not all sixteen bytes.
+
+    ``_contrib`` used to credit every operand of a call with ALL.  A call
+    carries the whole argument register set so DCE cannot delete argument
+    setup, so that one line made most values in a call-heavy function look
+    like opaque quadwords -- and it fed back: an `a rX, sp, 0x20` computing an
+    argument was credited ALL, which propagated into the stack pointer, so
+    even plain address arithmetic stopped scalarising.
+
+    Here the same function is analysed twice.  Without the hook the argument
+    setup demands everything; with a callee that only reads the preferred slot
+    of its first parameter, it narrows to the slot and the add becomes a
+    scalar.  The conservative answer is still the default, which is what keeps
+    an indirect call or a recursive cycle safe.
+    """
+    R3 = regs.ARG_FIRST
+    t = regs.NREG
+    call = Insn(Op.CALL, Var(regs.R_MEM),
+                [Var(regs.R_MEM), Var(regs.R_CH), Var(regs.LR), Var(R3)],
+                ea=0x108, aux=0x2000)
+    f = build("caller", [
+        (0x100, [
+            Insn(Op.ADD, Var(R3), [Var(80), Const(word0(0x20))], ea=0x100),
+            call,
+            # Nothing but the call may read r3, or the return's own
+            # conservative operand list would demand it whole and mask the
+            # effect under test.
+            Insn(Op.RET, None, [Var(regs.R_MEM), Var(regs.R_CH)], ea=0x10C),
+        ]),
+    ], [])
+    ssa.to_ssa(f)
+
+    add_key = next(i.defines().key() for i in f.insns() if i.op == Op.ADD)
+
+    wide = lanes.compute_demand(f)
+    assert wide[add_key] == lanes.ALL, (
+        "without the hook a call argument must stay conservative, got 0x%04X"
+        % wide[add_key])
+
+    # A callee that only uses its first parameter as an address.
+    def callee(ea):
+        assert ea == 0x2000, ea
+        return {R3: lanes.W0}
+
+    narrow = lanes.compute_demand(f, callee=callee)
+    assert narrow[add_key] == lanes.W0, (
+        "the callee reads only the preferred slot, so the argument setup "
+        "should too, got 0x%04X" % narrow[add_key])
+
+    # The filler operands are classified by what they are, hook or no hook:
+    # the link register a call reads is a return address, taken from the
+    # preferred slot, never a quadword.
+    for got in (wide.get((regs.LR, 0)), narrow.get((regs.LR, 0))):
+        assert got == lanes.W0, \
+            "the link register is a return address, got 0x%04X" % got
+    print("cross-procedural demand narrows call arguments: ok")
+    print()
 
 
 def main():
