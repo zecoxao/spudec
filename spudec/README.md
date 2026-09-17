@@ -268,43 +268,13 @@ verifier still applies to it.
   turns `t17 = r33 + 0x400` / `store.b mem, t17, r34` into
   `*(u8 *)(r33 + 0x400) = r34;`. Loads only inline when no memory write sits
   between definition and use, so nothing reorders across a store.
-- **Bitwise operations always print as C operators**, scalar or not. They are
-  lane-independent — byte *i* of the result depends only on byte *i* of the
-  inputs — so `&`, `|`, `^` mean the same thing at any width, with no element
-  width to lose. That is *not* true of arithmetic: `add.w` and `add.b` are
-  different operations on the same 128 bits, so those stay suffixed calls
-  unless the value is a proven scalar, or its type is a vector whose element
-  width matches the opcode (`a + b` on a `vec_uint4` really is the 32-bit
-  lane-wise add). The compound forms have exact spellings too: `~(a & b)`,
-  `~(a | b)`, `~(a ^ b)`, `a & ~b`, `a | ~b`, `~a`.
-
-  (`&&` would be wrong for a mask test — C's logical AND yields 0 or 1 and
-  short-circuits, where `and` masks bits.)
-
-- **The idioms behind them are peepholed.** The ISA has no `not`, so compilers
-  write `nor rt,ra,ra`, which would otherwise render as `~(a | a)`.
-  `simplify_identities` turns same-operand `nor`/`nand` into `~a`, `and`/`or`
-  into `a`, and `xor` into zero — in the IR rather than at render time, so the
-  SSA dump benefits too. Across metldr that leaves no call-style bitwise
-  operation and no `~(x | x)` anywhere:
-
-  ```c
-  if ( (r36 & 0x20000) == 0 )
-  if ( (qrotby(r6, r5) & 0xFFFF) == 0 )
-  if ( ((*(u32 *)(t111 + 0xA) & 0xFFFF) >u r4_5) != 0 )
-  ```
-
-- **Vector operations still print as calls**, not as expressions. Pretending
-  `shufb` is C would be a lie.
+- **Vector operations print as calls**, not as expressions. Pretending `shufb`
+  is C would be a lie; scalar operations — the ones demand analysis proved live
+  only in the preferred slot — print as ordinary arithmetic.
 
 ## Tests
 
-The harnesses live in `spudec-dev/` beside this repository, so the repo holds
-only what you install into IDA. They locate the package in the sibling repo
-automatically and write their output beside themselves, never in here.
-
 ```
-cd ../spudec-dev
 python selftest.py                       # ir / sem / ssa / opt, no IDA needed
 python romscan.py <blob>                 # endianness probe + lifter coverage
 ```
@@ -434,43 +404,13 @@ own — it is only real if the phi's result is, which has to be propagated
 backwards. Without that filter, `check_manu_revoked_version(void)` came out
 with eight parameters because r9 and r10 were merely in scope across a call.
 
-### Call arguments
-
-Knowing a callee's arity is what lets a call show its arguments. `arity_of()`
-recovers it on demand and memoises, recursing into the callee's own callees so
-a forwarded parameter is still found. Argument operands are then picked out of
-the call by *register number* — r3 first, r4 second — not by position in the
-operand list, so widening or narrowing the ABI operand set cannot silently
-reorder them.
-
-```c
-r4 = 0xC720;                      memcpy(0x0, 0xC720, 0x20);
-r5 = 0x20;             becomes    memcpy(0x20, 0xC740, 0x10);
-r3 = 0;                           memcpy(0x30, 0xC750, 0x8);
-memcpy();
-```
-
-Setup folds into the call only for operands that are actually rendered: a
-register written before a call that the callee never reads keeps its own
-statement, or the value would vanish from the listing. On metldr this removed
-about 2000 lines of argument-shuffling.
-
-Recursion is cut on an in-progress set, and **a result computed while a cycle
-was cut is not cached** — it is a lower bound, not the answer, and caching it
-would freeze in whatever the traversal order happened to produce, so the same
-function could get different signatures depending on what you decompiled
-first. Two versions of this got that wrong before the current one.
-
 Measured against the 95 mangled C++ names in metldr, which state the true
 prototype (and `this` for member functions): **75 exact, 19 under, 1 over.**
-
-The remaining under-counts are mutually recursive: `signed_elf::get_elf32_header`
-forwards its second argument to `elf_access::get_elf32_header`, which calls
-back, so whichever is asked about first hits the cut edge and settles low.
-Demand-driven recursion cannot fix that — it needs a worklist fixpoint over the
-call graph, iterating until arities stop growing. Erring low is at least the
-safe direction: it shows fewer parameters than exist rather than inventing
-ones, and nothing in the function body is hidden either way.
+The under-counts are parameters a function only forwards to another call, whose
+sole use is therefore an ABI list. Closing that needs the callee's arity —
+an interprocedural fixpoint this per-function pipeline does not do. Erring
+low is the safe direction: it shows fewer parameters than exist rather than
+inventing ones, and nothing in the body is hidden either way.
 
 ### Everything else
 
@@ -613,9 +553,10 @@ reads as one range rather than 339 — without that the corpus figure reads
   the viewer) is the ground truth if a rendering ever looks wrong.
 - Type recovery stops at scalars, pointers and vectors. No structs, no arrays,
   no typedefs: `p->field` and `a[i]` still read as pointer arithmetic.
-- Arity recovery cuts recursive call cycles rather than solving them, so
-  mutually recursive functions settle on a lower bound (19 of 95 on metldr).
-  A worklist fixpoint over the call graph would close it.
+- Parameter recovery is per-function, so a parameter that is only forwarded to
+  another call is missed (19 of 95 on metldr). Fixing it properly means
+  computing arity for the whole program to a fixpoint, so a call site can be
+  told how many of its argument registers the callee actually reads.
 - Switch dispatch is resolved only for the GCC jump-table idiom the patched
   `spu.py` matches. Other shapes still arrive as unreachable blocks; they are
   reported, not decompiled.

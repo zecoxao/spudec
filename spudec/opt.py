@@ -15,7 +15,7 @@ definition is ever duplicated.
 No IDA imports: unit-testable standalone.
 """
 
-from .ir import Op, Const, Var, Insn, ABI_OPS
+from .ir import Op, EW, Const, Var, Insn, ABI_OPS, MASK128
 from .sem import evaluate
 
 
@@ -140,6 +140,37 @@ def fold(func):
     return changed
 
 
+def simplify_identities(func):
+    """
+    Peephole the identities the SPU's own idioms create.
+
+    The ISA has no `not`, so compilers spell it `nor rt,ra,ra` -- which
+    otherwise renders as `~(a | a)`.  Same-operand `and`/`or` come out of
+    register moves, and `xor rt,ra,ra` is the standard zero.
+    """
+    changed = False
+    for insn in func.insns():
+        if len(insn.srcs) != 2:
+            continue
+        a, b = insn.srcs
+        same = ((a.is_var and b.is_var and a.key() == b.key())
+                or (a.is_const and b.is_const and a.val == b.val))
+        if not same:
+            continue
+        if insn.op in (Op.AND, Op.OR):
+            insn.op, insn.srcs = Op.MOV, [a]
+        elif insn.op in (Op.NOR, Op.NAND):
+            insn.op, insn.srcs = Op.NOT, [a]
+        elif insn.op == Op.XOR:
+            insn.op, insn.srcs, insn.ew = Op.CONST, [Const(0)], EW.Q
+        elif insn.op == Op.EQV:
+            insn.op, insn.srcs, insn.ew = Op.CONST, [Const(MASK128)], EW.Q
+        else:
+            continue
+        changed = True
+    return changed
+
+
 def dce(func):
     """Remove definitions nothing reads, iterating until stable."""
     removed = 0
@@ -167,6 +198,7 @@ def optimize(func, rounds=16):
     for _ in range(rounds):
         changed = False
         changed |= simplify_phis(func)
+        changed |= simplify_identities(func)
         changed |= propagate(func)
         changed |= fold(func)
         stats["rounds"] += 1

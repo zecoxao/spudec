@@ -41,6 +41,20 @@ from .structure import (Basic, If, Loop, Break, Continue, Goto, Label,
 CTYPE = {EW.B: "u8", EW.H: "u16", EW.W: "u32", EW.D: "u64", EW.Q: "qword"}
 MAX_INLINE_DEPTH = 4
 
+# Bitwise operations and their exact C spelling, with a flag saying whether
+# the form already brackets itself.  `~` binds tighter than `&` and `|`, so
+# `a & ~b` needs no inner parentheses.
+_BITWISE = {
+    Op.AND:  ("%s & %s", False),
+    Op.OR:   ("%s | %s", False),
+    Op.XOR:  ("%s ^ %s", False),
+    Op.NAND: ("~(%s & %s)", True),
+    Op.NOR:  ("~(%s | %s)", True),
+    Op.EQV:  ("~(%s ^ %s)", True),
+    Op.ANDC: ("%s & ~%s", False),
+    Op.ORC:  ("%s | ~%s", False),
+}
+
 
 # ---------------------------------------------------------------------------
 # naming (phi-web coalescing)
@@ -319,6 +333,34 @@ class CGen(object):
             args = ", ".join(self.operand(s, depth, False) for s in insn.srcs)
             return "%s(%s)" % (insn.aux, args)
 
+        # Bitwise operations are lane-independent: byte i of the result
+        # depends only on byte i of the inputs.  So `&`, `|`, `^` mean exactly
+        # the same thing whether the value is a scalar or a vector, and there
+        # is no element width to lose by writing them infix -- unlike `add.w`
+        # versus `add.b`, which are different operations on the same 128 bits.
+        #
+        # (`&&` would be wrong here: C's logical AND yields 0 or 1 and
+        # short-circuits, where this masks bits.)
+        if op in _BITWISE and len(insn.srcs) == 2:
+            wide = self._scalarish(insn)
+            fmt, wrapped = _BITWISE[op]
+            text = fmt % (self.operand(insn.srcs[0], depth, wide),
+                          self.operand(insn.srcs[1], depth, wide))
+            return text if (top or wrapped) else "(%s)" % text
+        if op == Op.NOT and len(insn.srcs) == 1:
+            return "~%s" % self.operand(insn.srcs[0], depth,
+                                        self._scalarish(insn))
+
+        # Element-wise arithmetic only reads infix when the width is not in
+        # doubt: either the value is a scalar, or its type is a vector whose
+        # element width matches the operation, so `a + b` on a `vec_uint4`
+        # really is the 32-bit lane-wise add the opcode performs.
+        if not sc and op in INFIX and len(insn.srcs) == 2 and insn.ew != EW.Q:
+            d = insn.defines()
+            t = self.type_of(d) if d is not None else None
+            if t is not None and t.kind == types.VEC and t.width == int(insn.ew):
+                sc = True
+
         if sc and op in INFIX and len(insn.srcs) == 2:
             lhs = self.operand(insn.srcs[0], depth, True)
             rhs = self.operand(insn.srcs[1], depth, True)
@@ -342,6 +384,23 @@ class CGen(object):
 
     def type_of(self, v):
         return self.types.of_var(v) if self.types is not None else None
+
+    def _scalarish(self, insn):
+        """
+        Should this result's constants be spelled as scalars?
+
+        True when scalarisation proved it lives in the preferred slot, or when
+        the recovered type is a scalar of at most word width.  A genuine
+        vector keeps the lane spelling, because `#0x20000:w4` says something
+        `0x20000` does not.
+        """
+        if insn.scalar:
+            return True
+        d = insn.defines()
+        t = self.type_of(d) if d is not None else None
+        return (t is not None
+                and t.kind in (types.INT, types.PTR, types.UNK)
+                and 0 < t.width <= 4)
 
     def ctype(self, ty, fallback="qword"):
         """
