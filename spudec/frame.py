@@ -120,7 +120,7 @@ def _group(saves):
     return runs
 
 
-def _signed(off):
+def signed_offset(off):
     """An offset as the address arithmetic means it, not as 32 bits."""
     off &= 0xFFFFFFFF
     return off - (1 << 32) if off >= (1 << 31) else off
@@ -161,7 +161,7 @@ def analyse(func):
             k = b.word0 if b.is_const else (a.word0 if a.is_const else None)
             other = a if b.is_const else b
             if k is not None and other.is_var and other.key() == sp_in:
-                delta = _signed(k)
+                delta = signed_offset(k)
                 if delta < 0:
                     fr.size = -delta
 
@@ -174,7 +174,7 @@ def analyse(func):
         base, off, _ = addr_expr(i.srcs[1], defs)
         if base != sp_in or (base, off) in read:
             continue
-        off = _signed(off)
+        off = signed_offset(off)
         if val.reg == regs.SP:
             fr.back_chain = off
         elif val.reg == regs.LR or regs.is_callee_saved(val.reg):

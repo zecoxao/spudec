@@ -89,7 +89,11 @@ def audit(text):
     a listing that does not add up.
 
     Registers the function only reads are exempt when marked `// live in`:
-    they arrive with a value, so there is nothing to assign.
+    they arrive with a value, so there is nothing to assign.  Stack slots,
+    marked `// stack`, are exempt for a different reason: they are storage,
+    not values.  A slot whose address this function hands to a callee is
+    filled by that callee, so `read_region_data(a1, &var_C0, ...)` followed
+    by a read of `var_C0` is a correct listing with no assignment in it.
     """
     import re
     lines = text.splitlines()
@@ -124,7 +128,7 @@ def audit(text):
     code = "\n".join(code)
 
     for n, note in names.items():
-        if "live in" in note:
+        if "live in" in note or "stack" in note:
             continue
         assigned = re.search(r"(?:^|[^\w.>])\*?" + re.escape(n)
                              + r"\s*(?:=[^=]|\+\+|--)", code, re.M)
@@ -426,6 +430,90 @@ def test_prologue_moves_to_the_header():
     # the frame pass creates.
     body = text.split(chr(10) + "{" + chr(10), 1)[1]
     assert "r80" not in body, "r80 is still declared:" + chr(10) + text
+
+
+# ---------------------------------------------------------------------------
+# stack slots print as IDA's frame members
+# ---------------------------------------------------------------------------
+
+
+def test_stack_slots_print_as_names():
+    """
+    One slot, one name, whatever width each access uses.
+
+    Identity comes from this decompiler -- ``addr_expr`` resolving an address
+    to ``(base, offset)`` -- and the *name* comes from IDA, so a slot the user
+    renamed shows the new name.  Grouping by IDA's name instead let one
+    location print two ways, because a write through a form IDA had not
+    labelled stayed an explicit dereference while the read became a name.
+
+    Checked here: the widest access prints as the bare name; a narrower one
+    casts through the slot's address rather than falling back to the raw
+    expression; taking the address prints ``&var_30``; and the slot the
+    prologue uses for the back chain is not named, since ``sp_2 = &var_20``
+    would hide that sp_2 is the frame pointer.
+    """
+    R3 = regs.ARG_FIRST
+    SP, M = regs.SP, regs.R_MEM
+    t = regs.NREG
+    MASK = Const(word0(0x3FFF0))
+
+    def slot(tmp, off, base=SP, base_ver_of=None):
+        return [Insn(Op.ADD, Var(tmp), [Var(base), Const(word0(off))],
+                     ew=EW.W, ea=0x100),
+                Insn(Op.AND, Var(tmp + 1), [Var(tmp), MASK], ew=EW.W,
+                     ea=0x104)]
+
+    insns = []
+    # the back chain: sp is stored into sp-0x20, so -0x20 is the frame's own
+    insns += slot(t, -0x20)
+    insns.append(Insn(Op.STOREQ, Var(M), [Var(M), Var(t + 1), Var(SP)],
+                      ew=EW.Q, ea=0x108))
+    # a real slot at -0x30, written wide and read narrow
+    insns += slot(t + 2, -0x30)
+    insns.append(Insn(Op.STOREQ, Var(M), [Var(M), Var(t + 3), Var(R3)],
+                      ew=EW.Q, ea=0x10C))
+    insns += slot(t + 4, -0x30)
+    insns.append(Insn(Op.LOAD, Var(R3 + 1), [Var(M), Var(t + 5)], ew=EW.W,
+                      ea=0x110))
+    # and its address, handed to a call -- in r3, the first argument
+    # register, so the call really renders it as an argument
+    insns.append(Insn(Op.ADD, Var(R3), [Var(SP), Const(word0(-0x30))],
+                      ew=EW.W, ea=0x114))
+    insns.append(Insn(Op.CALL, Var(M),
+                      [Var(M), Var(regs.R_CH), Var(regs.LR), Var(R3)],
+                      ea=0x118, aux=0x4000))
+    insns.append(Insn(Op.RET, None, abi_ret(), ea=0x11C))
+    f = build("slots", [(0x100, insns)], [])
+
+    # The stub stands in for ida_frame: every access at these addresses is
+    # the same frame member.  A real resolver answers per instruction.
+    named = {0x10C: ("var_30", 16), 0x110: ("var_30", 16),
+             0x108: ("var_20", 16)}
+
+    ssa.to_ssa(f)
+    problems = ssa.verify(f)
+    assert not problems, chr(10).join(problems)
+    f.stats = opt.optimize(f)
+    stmts, info = structure.structure(f)
+    f.structure_info = info
+    text = chr(10).join(cgen.generate(
+        f, stmts, info, name_of=lambda ea: "sub_%X" % ea,
+        arity_of=lambda ea: 1, stk_of=lambda ea: named.get(ea)))
+    audit(text)
+    show("stack slots as frame members", text)
+
+    expect(text,
+           "var_30 = ",                      # the widest access, bare
+           "*(u32 *)&var_30",                # a narrower one casts
+           "= &var_30;",                     # computing its address
+           "// stack")                       # declared, and marked as such
+    assert "var_20" not in text, (
+        "the back-chain slot is the frame's own, not a local:" + chr(10)
+        + text)
+    assert "0x3FFF0" not in text.split("{", 1)[1], (
+        "every access to the slot should be named, none left explicit:"
+        + chr(10) + text)
 
 
 # ---------------------------------------------------------------------------

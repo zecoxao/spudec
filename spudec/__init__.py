@@ -307,6 +307,12 @@ def decompile_all(name_of=None, progress=None, funcs=None, **kw):
     return head + body, stats
 
 
+def stackvars():
+    """The shared stack-slot resolver (see stack.py)."""
+    from . import stack
+    return stack.stackvars()
+
+
 def strings():
     """The shared constant-address-to-string-literal resolver (see data.py)."""
     from . import data
@@ -326,13 +332,15 @@ def clear_caches():
     Call after retyping data or renaming functions in the database; the
     resolvers cache per session so the whole-database pass stays fast.
     """
-    from . import data
+    from . import data, stack
     data.clear()
+    stack.clear()
     clear_arity_cache()
     clear_param_demand()
 
 
-def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):
+def pseudocode(ea, name_of=None, arity=None, str_of=None,
+               stk_of=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
@@ -342,7 +350,8 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):
 
     ``str_of`` resolves a constant address to a C string literal; it defaults
     to the shared database-backed resolver, and passing ``lambda ea: None``
-    turns the feature off.
+    turns the feature off.  ``stk_of`` is the same arrangement for stack
+    slots, which come from IDA's frame analysis; see stack.py.
     """
     from . import cgen
     func = ea if isinstance(ea, Function) else decompile(ea, **kw)
@@ -353,5 +362,7 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None, **kw):
         str_of = strings()
     if name_of is None:
         name_of = names()
+    if stk_of is None:
+        stk_of = stackvars()
     return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity,
-                         str_of=str_of)
+                         str_of=str_of, stk_of=stk_of)

@@ -274,7 +274,8 @@ def _chain_positions(ok, defs, use_site):
 
 class CGen(object):
 
-    def __init__(self, func, name_of=None, arity_of=None, str_of=None):
+    def __init__(self, func, name_of=None, arity_of=None, str_of=None,
+                 stk_of=None):
         self.func = func
         self.arity_of = arity_of
         # Resolves a constant address to a string literal; see data.py.  None
@@ -324,6 +325,20 @@ class CGen(object):
         # what this function does.  `generate` states them in the header
         # instead; see frame.py for what makes a store recognisable as one.
         self.frame = frame.analyse(func)
+        # Stack slots by name, from IDA's frame analysis.  Off by default:
+        # cgen stays runnable without a database, exactly as with `str_of`.
+        self.stk_of = stk_of or (lambda ea: None)
+        # Resolved on first use, not here: deciding a slot's C type needs
+        # the recovered types, and type recovery runs later in this
+        # constructor.
+        self._slots = None
+        # name -> C type, filled as the body prints them, so `declarations`
+        # declares the slots the listing actually mentions and no others.
+        self.stack_decls = {}
+        # Stack-derived addresses that did not resolve to a fixed slot.  Any
+        # of them could alias a named slot, so the header says how many
+        # there were rather than the pass pretending there were none.
+        self.stack_unresolved = 0
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
         # Recover types now rather than earlier in the pipeline: inference has
@@ -429,6 +444,17 @@ class CGen(object):
     def rhs(self, insn, depth=0, top=True, want_scalar=False, strings=True):
         op = insn.op
         sc = insn.scalar
+
+        # An address computed into a named slot is that slot's address.  This
+        # is what connects the two halves of the common idiom: a pointer into
+        # the frame handed to a callee, and the slot read back afterwards.
+        # Without it the listing showed `r7 = (char *)sp_2 + 0x20;` and later
+        # `r8 = shufb(r8, var_130, r10);` with nothing to say those are the
+        # same sixteen bytes.
+        if op == Op.ADD and insn.ew == EW.W:
+            slot = self._addr_of_slot(insn)
+            if slot is not None:
+                return slot
 
         if op == Op.CONST:
             # A constant assigned to something the types say is a scalar
@@ -619,6 +645,158 @@ class CGen(object):
             return str(ty)
         return CTYPE[insn.ew]
 
+    def _slot_types(self):
+        """
+        Which stack slots may print as a name, what it is, and its C type.
+
+        The division of labour matters.  *Identity* comes from this
+        decompiler: :func:`scalarize.addr_expr` resolves an address to
+        ``(base, offset)``, and two accesses are the same slot when they
+        resolve to the same pair relative to the incoming stack pointer.  The
+        *name* comes from IDA, because that is the name the disassembly shows
+        and the one the user gets to choose.
+
+        Doing it the other way round -- grouping by IDA's name alone -- named
+        a slot that was read through a displacement operand IDA had labelled
+        and written through a form it had not, so one location printed two
+        ways and nothing said they were the same address.
+
+        Three conditions, each of which really fires on this corpus:
+
+        * some access to it carries an IDA frame member, to take the name
+          from.
+        * the slot is declared at its *widest* access, and a narrower access
+          prints as ``*(u32 *)&var_30``.  Requiring one width throughout
+          instead dropped two thirds of the slots, because a quadword buffer
+          read back a word at a time is ordinary here -- and the cast form
+          still shows the reader it is the same slot, which the explicit
+          ``*(u32 *)((sp_2 + 0x50) & 0x3FFF0)`` does not.  Where two types
+          share that widest access (a load typed `int` and a store typed
+          `u32`), the plain integer spelling is used rather than asserting a
+          signedness the code does not settle.
+        A stack-derived address this pass cannot resolve to a fixed offset --
+        a dynamic index into a stack array, or the ``(x & ~0xF) + k`` shape
+        ``addr_expr`` deliberately refuses to simplify -- could reach any
+        slot.  Switching naming off for the whole function on that basis cost
+        nine tenths of the feature (892 named lines down to 78) and would be
+        out of step with the rest of the tool, which assumes bounded aliasing
+        and says so: ``recover_stores`` reports ``assumed_noalias`` rather
+        than giving up.  So the count is recorded and stated in the header
+        instead.
+        """
+        from .scalarize import addr_expr
+
+        sp_in = (regs.SP, 0)
+        # Values built from the incoming stack pointer, so an address that
+        # fails to resolve can be recognised as *stack*-derived rather than
+        # merely unknown.
+        # To a fixpoint, not in one pass: a phi can take an argument defined
+        # later in iteration order, and a loop-carried stack pointer would
+        # otherwise escape the taint entirely.
+        #
+        # Pseudo-registers are excluded at both ends.  Memory is one of them,
+        # and a store's operands include both its address and the memory
+        # chain, so letting taint through R_MEM would mark every subsequent
+        # load -- and then every address computed from a loaded value -- as
+        # stack-derived, which switches the whole feature off everywhere.
+        tainted = {sp_in}
+        changed = True
+        while changed:
+            changed = False
+            for insn in self.func.insns():
+                d = insn.defines()
+                if d is None or d.reg in regs.PSEUDO or d.key() in tainted:
+                    continue
+                if any(s.is_var and s.reg not in regs.PSEUDO
+                       and s.key() in tainted for s in insn.srcs):
+                    tainted.add(d.key())
+                    changed = True
+
+        groups = {}
+        for insn in self.func.insns():
+            if insn.op not in MEM_READS and insn.op not in MEM_WRITES:
+                continue
+            if len(insn.srcs) < 2:
+                continue
+            base, off, _ = addr_expr(insn.srcs[1], self.defs)
+            if base != sp_in:
+                if base in tainted:
+                    self.stack_unresolved += 1
+                continue
+            g = groups.setdefault((base, off),
+                                  {"ew": None, "types": {}, "name": None})
+            ew = insn.ew
+            if g["ew"] is None or int(ew) > int(g["ew"]):
+                g["ew"] = ew
+            g["types"].setdefault(ew, set()).add(self._access_type(insn))
+            if g["name"] is None:
+                hit = self.stk_of(insn.ea)
+                if hit is not None and hit[0]:
+                    g["name"] = hit[0]
+
+        # The frame's own slots are not locals.  Naming them turned the frame
+        # adjust into `sp_2 = &var_150;` -- true, since the new stack pointer
+        # is the back chain's address, but it hides that sp_2 is the frame
+        # pointer, and it declared a slot whose only write the prologue pass
+        # had just hidden.
+        reserved = {off for off, _ in self.frame.saves}
+        if self.frame.back_chain is not None:
+            reserved.add(self.frame.back_chain)
+
+        out = {}
+        for key, g in groups.items():
+            if g["name"] is None or frame.signed_offset(key[1]) in reserved:
+                continue
+            widest = g["types"][g["ew"]]
+            ct = widest.pop() if len(widest) == 1 else CTYPE[g["ew"]]
+            out[key] = (g["name"], ct, g["ew"])
+        return out
+
+    def _addr_of_slot(self, insn):
+        """
+        ``&var_30`` when this instruction computes a named slot's address.
+
+        Deliberately narrow: the value has to resolve to *exactly* a slot the
+        listing already names, so this never invents a name and never prints
+        an address that is merely near one.  The declaration is registered
+        here too, because taking a slot's address is as much a mention of it
+        as reading it.
+        """
+        if self._slots is None:
+            self._slots = self._slot_types()
+        if not self._slots:
+            return None
+        from .scalarize import addr_expr
+        d = insn.defines()
+        if d is None:
+            return None
+        hit = self._slots.get(addr_expr(d, self.defs)[:2])
+        if hit is None:
+            return None
+        self.stack_decls[hit[0]] = hit[1]
+        return "&" + hit[0]
+
+    def _stack_name(self, insn):
+        """
+        How this access prints as a named slot: the name, or None.
+
+        A narrower access than the slot's own width takes the address of the
+        slot and casts, which keeps one name for one location.
+        """
+        if self._slots is None:
+            self._slots = self._slot_types()
+        if not self._slots or len(insn.srcs) < 2:
+            return None
+        from .scalarize import addr_expr
+        hit = self._slots.get(addr_expr(insn.srcs[1], self.defs)[:2])
+        if hit is None:
+            return None
+        name, ct, ew = hit
+        self.stack_decls[name] = ct
+        if insn.ew == ew:
+            return name
+        return "*(%s *)&%s" % (self._access_type(insn), name)
+
     def _deref(self, insn, depth=0):
         """
         `*p` when the address is a pointer of the right shape, `*(T *)(e)`
@@ -627,6 +805,11 @@ class CGen(object):
         """
         addr = insn.srcs[1]
         t = self._access_type(insn)
+        # A slot IDA resolved to a frame member prints as that member: it is
+        # the name the disassembly shows, including one the user chose.
+        slot = self._stack_name(insn)
+        if slot is not None:
+            return slot
         pt = self.type_of(addr)
         if (pt is not None and pt.kind == types.PTR and addr.is_var
                 and addr.key() not in self.inlinable
@@ -709,7 +892,14 @@ class CGen(object):
                     continue
                 live_in[nm] = self.ctype(self.type_of(u))
 
-        if not by_name and not live_in:
+        # Stack slots are storage, not values: a slot this function only
+        # reads was filled by something else (a callee handed a pointer to
+        # it), so unlike a register name it is declared whether or not
+        # anything here assigns it.  The annotation says which kind it is.
+        stack = {nm: ct for nm, ct in self.stack_decls.items()
+                 if nm not in pnames and nm not in by_name}
+
+        if not by_name and not live_in and not stack:
             return []
         groups = {}
         for nm, ct in by_name.items():
@@ -725,6 +915,12 @@ class CGen(object):
                                        "   // live in"))
         for ct in sorted(groups):
             out.extend(_decl_lines(ct, sorted(groups[ct])))
+        if stack:
+            st = {}
+            for nm, ct in stack.items():
+                st.setdefault(ct, []).append(nm)
+            for ct in sorted(st):
+                out.extend(_decl_lines(ct, sorted(st[ct]), "   // stack"))
         return out
 
     # -- statements --------------------------------------------------------
@@ -1117,9 +1313,10 @@ def _signature(g, func):
     return ret, (", ".join(plist) or "void")
 
 
-def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None):
+def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
+             stk_of=None):
     """Render the structured AST as pseudocode lines."""
-    g = CGen(func, name_of, arity_of, str_of)
+    g = CGen(func, name_of, arity_of, str_of, stk_of)
     name = func.name or "sub_%X" % func.start_ea
     ret, params = _signature(g, func)
 
@@ -1150,6 +1347,9 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None):
     fr = g.frame.describe()
     if fr:
         out.append("// " + fr)
+    # Which slots got named is only known once the body has been rendered, so
+    # the line is inserted here afterwards rather than appended out of order.
+    stack_note_at = len(out)
     if g.params:
         out.append("// parameters: %s"
                    % "  ".join("%s = %s" % (g.param_name[r], regs.reg_name(r))
@@ -1162,6 +1362,13 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None):
     info = dict(info, labels=set(info.get("labels", ())))
     body = []
     g.emit(stmts, body, 1, info)
+    if g.stack_decls or g.stack_unresolved:
+        note = "// stack: %d slot(s) named from the frame" % len(
+            g.stack_decls)
+        if g.stack_unresolved:
+            note += ("; %d stack address(es) did not resolve to a slot and "
+                     "are assumed not to alias one" % g.stack_unresolved)
+        out.insert(stack_note_at, note)
     decls = g.declarations()
     if decls:
         out.extend(decls)
