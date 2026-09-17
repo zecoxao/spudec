@@ -297,11 +297,20 @@ def test_deep_inline_chain():
 
 
 def main():
-    test_deep_inline_chain()
-    test_no_raw_name_of()
-    test_phi_constant_assignment()
-    test_strings()
-    print("all tests passed")
+    """
+    Run every ``test_*`` in this file, in definition order.
+
+    Listing them by hand drifted: `test_strings` and `test_deep_inline_chain`
+    were both defined and never called, so they passed by not running.
+    """
+    import inspect
+    mod = sys.modules[__name__]
+    tests = [(n, f) for n, f in vars(mod).items()
+             if n.startswith("test_") and inspect.isfunction(f)]
+    tests.sort(key=lambda nf: nf[1].__code__.co_firstlineno)
+    for name, fn in tests:
+        fn()
+    print("all %d tests passed" % len(tests))
 
 
 if __name__ == "__main__":

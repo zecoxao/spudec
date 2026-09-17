@@ -308,6 +308,9 @@ class CGen(object):
         # Names the rendered body actually mentions; `declarations` declares
         # exactly these, so the two can never disagree.
         self.printed = set()
+        # Names that appear as an assignment target, which is what makes a
+        # name a local rather than something the function only reads.
+        self.assigned = set()
         self.mute = _muted_clobbers(func, self._rendered_keys())
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
@@ -347,6 +350,20 @@ class CGen(object):
         """The printed name of a value, recording that it was printed."""
         name = self.namer.name(v)
         self.printed.add(name)
+        return name
+
+    def nma(self, v):
+        """
+        The printed name of an *assignment target*.
+
+        Kept apart from :meth:`nm` because a phi web shares one name across
+        many SSA values: a callee-saved register's name is printed by the
+        prologue save, which reads the incoming value, while the definition
+        that would assign it -- the epilogue restore -- prints nothing.  Only
+        a name that really gets assigned somewhere is a local.
+        """
+        name = self.nm(v)
+        self.assigned.add(name)
         return name
 
 
@@ -598,7 +615,7 @@ class CGen(object):
                 # claimed as a local that is never assigned.
                 continue
             nm = self.namer.name(d)
-            if nm not in self.printed:
+            if nm not in self.assigned:
                 # Folded into its use site, or simply dead -- either way the
                 # body never mentions the name.  Note this must NOT test
                 # `inlinable` on its own: it is `_inlinable`'s depth pruning
@@ -692,7 +709,7 @@ class CGen(object):
             # return values (r3..r74), is the callee's result.  The call
             # statement is printed immediately above, so naming the callee
             # again on each line would read as several separate calls.
-            return "%s = <result in %s>;" % (self.nm(d),
+            return "%s = <result in %s>;" % (self.nma(d),
                                              regs.reg_name(d.reg))
         if d is not None and self._suppressed(insn, d):
             return None
@@ -734,7 +751,7 @@ class CGen(object):
         if op in (Op.CALL, Op.ICALL):
             text = self.rhs(insn)
             if d is not None and d.reg not in regs.PSEUDO:
-                return "%s = %s;" % (self.nm(d), text)
+                return "%s = %s;" % (self.nma(d), text)
             return text + ";"
         if op == Op.NOP:
             return None
@@ -743,7 +760,7 @@ class CGen(object):
             return self.rhs(insn) + ";"
         if d.reg in regs.PSEUDO:
             return None                       # pure bookkeeping, not code
-        return "%s = %s;" % (self.nm(d), self.rhs(insn))
+        return "%s = %s;" % (self.nma(d), self.rhs(insn))
 
     # -- the AST -----------------------------------------------------------
 
