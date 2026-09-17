@@ -44,6 +44,13 @@ MAX_INLINE_DEPTH = 4
 # Bitwise operations and their exact C spelling, with a flag saying whether
 # the form already brackets itself.  `~` binds tighter than `&` and `|`, so
 # `a & ~b` needs no inner parentheses.
+# Compares produce an all-ones mask per lane, not 0 or 1, so `a > b` is only
+# a fair rendering once scalarisation has *proved* the value lives in the
+# preferred slot -- `insn.scalar`.  Type evidence alone is weaker, and a mask
+# that reaches an `&` or a `selb` would then read as a boolean.  So the
+# type-based rule below deliberately leaves these as lane calls.
+_MASK_OPS = frozenset((Op.CMPEQ, Op.CMPGT, Op.CMPGTU))
+
 _BITWISE = {
     Op.AND:  ("%s & %s", False),
     Op.OR:   ("%s | %s", False),
@@ -479,18 +486,34 @@ class CGen(object):
                                         self._scalarish(insn))
 
         # Element-wise arithmetic only reads infix when the width is not in
-        # doubt: either the value is a scalar, or its type is a vector whose
-        # element width matches the operation, so `a + b` on a `vec_uint4`
-        # really is the 32-bit lane-wise add the opcode performs.
+        # doubt.  Three ways for it not to be:
+        #
+        #   * scalarisation proved the value lives in the preferred slot
+        #     (`sc` is already set);
+        #   * its type is a vector whose element width matches the operation,
+        #     so `a + b` on a `vec_uint4` really is the 32-bit lane-wise add
+        #     the opcode performs;
+        #   * its type occupies no more than one element -- an address, or
+        #     anything demand analysis narrowed to a word or less.  Then one
+        #     lane is all there is, and `sp - 0x13B0` says what `add.w(sp,
+        #     #0xffffec50:w4)` says, only legibly.  Stack-frame arithmetic is
+        #     the commonest arithmetic in this code, and it all lands here.
         if not sc and op in INFIX and len(insn.srcs) == 2 and insn.ew != EW.Q:
             d = insn.defines()
             t = self.type_of(d) if d is not None else None
             if t is not None and t.kind == types.VEC and t.width == int(insn.ew):
                 sc = True
+            elif (t is not None and op not in _MASK_OPS
+                    and self._scalarish(insn)
+                    and 0 < t.width <= int(insn.ew)):
+                sc = True
 
         if sc and op in INFIX and len(insn.srcs) == 2:
             lhs = self.operand(insn.srcs[0], depth, True)
             rhs = self.operand(insn.srcs[1], depth, True)
+            if op in (Op.ADD, Op.SUB):
+                lhs = self._byte_ptr(insn.srcs[0], lhs)
+                rhs = self._byte_ptr(insn.srcs[1], rhs)
             sym = INFIX[op]
             # `ai rX, rX, -1` is everywhere; print it as subtraction rather
             # than as an addition of a negative literal.
@@ -511,6 +534,26 @@ class CGen(object):
 
     def type_of(self, v):
         return self.types.of_var(v) if self.types is not None else None
+
+    def _byte_ptr(self, v, text):
+        """
+        Cast a pointer operand of arithmetic to `char *`.
+
+        SPU address arithmetic is in bytes and C pointer arithmetic scales, so
+        `sp - 0x13B0` on an `unsigned int *` would read as 0x4EC0 bytes -- not
+        what the instruction does.  The cast is the only thing keeping the
+        printed expression equal to the machine's.  An operand already
+        rendered as a byte cast, or already pointing at bytes, is left alone.
+        """
+        t = self.type_of(v)
+        if t is None or t.kind != types.PTR:
+            return text
+        if t.pointee is not None and t.pointee.width == 1:
+            return text
+        if text.startswith("(char *)"):
+            return text
+        return "(char *)%s" % (text if text.isidentifier()
+                               else "(%s)" % text)
 
     def _scalarish(self, insn):
         """

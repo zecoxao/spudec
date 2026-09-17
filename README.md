@@ -43,6 +43,24 @@ listing that referred to a value it never showed being computed:
 `tests/test_pipeline.py` audits every function it renders for exactly this
 agreement, so a regression in either direction fails a test.
 
+## Lane-wise arithmetic
+
+`a rt, ra, rb` adds four 32-bit lanes, so it is only fair to print `a + b`
+when the reader cannot be misled about which lanes are involved. That holds
+when scalarisation proved the value lives in the preferred slot, when the
+recovered type is a vector whose element width matches, or when the type
+occupies no more than one element -- an address, or anything demand analysis
+narrowed to a word. Stack-frame arithmetic is all of the third kind, which is
+why `add.w(sp, #0xffffec50:w4)` now reads `(char *)sp - 0x13B0`.
+
+Compares are deliberately excluded from the type-based case: they produce an
+all-ones mask per lane rather than 0 or 1, so `a > b` is only fair once
+scalarisation has *proved* the preferred slot, not merely made it likely.
+
+Address arithmetic carries an explicit `(char *)` because C pointer
+arithmetic scales and the SPU's does not -- `sp - 0x13B0` on an
+`unsigned int *` would mean 0x4EC0 bytes.
+
 ## Tests
 
     python tests/test_pipeline.py
