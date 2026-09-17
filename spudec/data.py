@@ -143,12 +143,29 @@ class Strings(object):
 
     @staticmethod
     def _defined(ea):
-        """A string literal IDA already has at exactly this address."""
+        """
+        The string literal IDA has at -- or *covering* -- this address.
+
+        The address need not be the literal's head.  A compiler pools the
+        shared tail of one string as another, so `"buf_addr is NULL\n"`
+        defined at 0x19780 is also where the bare `"\n"` at 0x19790 lives,
+        and a `put_s(0x19790)` really does print just the newline.  Resolving
+        through the item head is what makes that read as a string, and it
+        keeps the decompiler agreeing with the disassembly about what the byte
+        range is.
+
+        Length and content are not questioned here: this tier is IDA's own
+        analysis plus whatever the user marked up by hand, which outranks any
+        guess.  The sniffer below is the tier that has to be strict, because
+        it is the one guessing.
+        """
         import ida_bytes
         import ida_nalt
-        flags = ida_bytes.get_flags(ea)
-        if not ida_bytes.is_strlit(flags):
+        head = ida_bytes.get_item_head(ea)
+        if not ida_bytes.is_strlit(ida_bytes.get_flags(head)):
             return None
+        # Read from `ea`, not from the head: the tail is what the code points
+        # at, and reporting the whole string would be wrong.
         raw = ida_bytes.get_strlit_contents(ea, -1, ida_nalt.STRTYPE_C)
         if not raw:
             return None
