@@ -376,6 +376,57 @@ class Members(object):
 
 
 # ---------------------------------------------------------------------------
+# named data symbols
+# ---------------------------------------------------------------------------
+#
+# A folded address is a plain literal, and a great many point at *named* data:
+# a vtable, a key table, a global.  `0x2E698` says nothing; `&`vtable
+# for'lv0::secure_key_ring_manager` says the object being built is a
+# secure_key_ring_manager, which is the whole point of the store.  So a
+# constant equal to the address of a real symbol prints as that symbol.
+
+
+class Symbols(object):
+    """
+    Resolves a constant address to the name of the symbol at it, or None.
+
+    "Symbol" means a real name -- one linked in, or given by hand -- not one of
+    IDA's auto-generated placeholders (`byte_2E694`, `off_...`), which name a
+    location only because something referenced it and say nothing a literal
+    does not.  A vtable reads best as ``Class::vtable``; every other symbol
+    keeps its (demangled) name.
+    """
+
+    def __init__(self):
+        self._cache = {}
+
+    def __call__(self, ea):
+        if ea in self._cache:
+            return self._cache[ea]
+        out = self._lookup(ea)
+        self._cache[ea] = out
+        return out
+
+    def _lookup(self, ea):
+        try:
+            import ida_bytes
+            import ida_name
+        except ImportError:
+            return None
+        if ea <= 0 or not ida_bytes.is_loaded(ea):
+            return None
+        raw = ida_name.get_name(ea)
+        if not raw or ida_bytes.has_dummy_name(ida_bytes.get_flags(ea)):
+            return None
+        if raw.startswith("_ZTV"):
+            d = ida_name.demangle_name(raw, ida_name.MNG_NODEFINIT)
+            if d and "for'" in d:
+                return _sanitise(d.split("for'", 1)[1].strip()) + "::vtable"
+            return _sanitise(raw)
+        return demangle(raw) or raw
+
+
+# ---------------------------------------------------------------------------
 # shared, per-session resolvers
 # ---------------------------------------------------------------------------
 #
@@ -387,6 +438,7 @@ class Members(object):
 _STRINGS = None
 _NAMES = None
 _MEMBERS = None
+_SYMBOLS = None
 
 
 def strings():
@@ -410,9 +462,17 @@ def members():
     return _MEMBERS
 
 
+def symbols():
+    global _SYMBOLS
+    if _SYMBOLS is None:
+        _SYMBOLS = Symbols()
+    return _SYMBOLS
+
+
 def clear():
     """Forget everything -- call after retyping data or renaming functions."""
-    global _STRINGS, _NAMES, _MEMBERS
+    global _STRINGS, _NAMES, _MEMBERS, _SYMBOLS
     _STRINGS = None
     _NAMES = None
     _MEMBERS = None
+    _SYMBOLS = None

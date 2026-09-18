@@ -337,6 +337,12 @@ def members():
     return data.members()
 
 
+def symbols():
+    """The shared resolver from a constant address to a named data symbol."""
+    from . import data
+    return data.symbols()
+
+
 def clear_caches():
     """
     Forget recovered strings and names.
@@ -352,7 +358,7 @@ def clear_caches():
 
 
 def pseudocode(ea, name_of=None, arity=None, str_of=None,
-               stk_of=None, this_of=None, **kw):
+               stk_of=None, this_of=None, sym_of=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
@@ -380,5 +386,8 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
         stk_of = stackvars()
     if this_of is None:
         this_of = members()
+    if sym_of is None:
+        sym_of = symbols()
     return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity,
-                         str_of=str_of, stk_of=stk_of, this_of=this_of)
+                         str_of=str_of, stk_of=stk_of, this_of=this_of,
+                         sym_of=sym_of)

@@ -304,12 +304,16 @@ def _chain_positions(ok, defs, use_site):
 class CGen(object):
 
     def __init__(self, func, name_of=None, arity_of=None, str_of=None,
-                 stk_of=None, this_of=None):
+                 stk_of=None, this_of=None, sym_of=None):
         self.func = func
         self.arity_of = arity_of
         # Resolves a constant address to a string literal; see data.py.  None
         # disables it, which is what a database-free caller wants.
         self.str_of = str_of or (lambda ea: None)
+        # Resolves a constant address to a named data symbol (a vtable, a key
+        # table, a global), so it prints as `&name` instead of a bare literal.
+        # Off by default, like `str_of`, so cgen runs without a database.
+        self.sym_of = sym_of or (lambda ea: None)
         # Which operands of each call are really its arguments.  Needs the
         # callee's arity: the operand list names every argument register
         # because a callee *might* read them, so without knowing how many it
@@ -468,6 +472,9 @@ class CGen(object):
             lit = self.str_of(c.val >> 96)
             if lit is not None:
                 return lit
+        sym = self.sym_of(c.val >> 96)
+        if sym is not None:
+            return "&" + sym
         return c.scalar_str() if scalar else str(c)
 
     def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False,
@@ -495,6 +502,9 @@ class CGen(object):
                 lit = self.str_of(v.val >> 96)
                 if lit is not None:
                     return lit
+            sym = self.sym_of(v.val >> 96)
+            if sym is not None:
+                return "&" + sym
             return "0x%X" % (v.val >> 96)
         return self.operand(v, depth, top=True, want_scalar=True,
                             strings=strings)
@@ -1548,9 +1558,9 @@ def _signature(g, func):
 
 
 def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
-             stk_of=None, this_of=None):
+             stk_of=None, this_of=None, sym_of=None):
     """Render the structured AST as pseudocode lines."""
-    g = CGen(func, name_of, arity_of, str_of, stk_of, this_of)
+    g = CGen(func, name_of, arity_of, str_of, stk_of, this_of, sym_of)
     name = func.name or "sub_%X" % func.start_ea
     ret, params = _signature(g, func)
 
