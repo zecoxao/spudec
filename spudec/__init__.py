@@ -331,6 +331,12 @@ def names():
     return data.names()
 
 
+def members():
+    """The shared resolver from a function to the class it is a member of."""
+    from . import data
+    return data.members()
+
+
 def clear_caches():
     """
     Forget recovered strings and names.
@@ -346,7 +352,7 @@ def clear_caches():
 
 
 def pseudocode(ea, name_of=None, arity=None, str_of=None,
-               stk_of=None, **kw):
+               stk_of=None, this_of=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
@@ -357,7 +363,9 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
     ``str_of`` resolves a constant address to a C string literal; it defaults
     to the shared database-backed resolver, and passing ``lambda ea: None``
     turns the feature off.  ``stk_of`` is the same arrangement for stack
-    slots, which come from IDA's frame analysis; see stack.py.
+    slots, which come from IDA's frame analysis; see stack.py.  ``this_of``
+    resolves a function to the class it is a member of, so its r3 prints as
+    ``this``.
     """
     from . import cgen
     func = ea if isinstance(ea, Function) else decompile(ea, **kw)
@@ -370,5 +378,7 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
         name_of = names()
     if stk_of is None:
         stk_of = stackvars()
+    if this_of is None:
+        this_of = members()
     return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity,
-                         str_of=str_of, stk_of=stk_of)
+                         str_of=str_of, stk_of=stk_of, this_of=this_of)

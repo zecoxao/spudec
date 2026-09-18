@@ -304,7 +304,7 @@ def _chain_positions(ok, defs, use_site):
 class CGen(object):
 
     def __init__(self, func, name_of=None, arity_of=None, str_of=None,
-                 stk_of=None):
+                 stk_of=None, this_of=None):
         self.func = func
         self.arity_of = arity_of
         # Resolves a constant address to a string literal; see data.py.  None
@@ -329,10 +329,25 @@ class CGen(object):
         # decompiler shows them; the register each one came from goes in the
         # header comment so the mapping back to the disassembly is not lost.
         self.params = _params(func, arity_of)
+        # A non-static member function's r3 is the hidden `this`, named from
+        # the class the function belongs to (see data.Members and `_this_reg`).
+        self.member_class = this_of(func.start_ea) if this_of is not None \
+            else None
+        self.this_reg = self._this_reg()
+        # A member that reads nothing still has a `this`; `_params` only counts
+        # registers with a use, so give it one.  Otherwise r3 already leads the
+        # contiguous parameter list.
+        if self.this_reg is not None and not self.params:
+            self.params = [self.this_reg]
         self.param_name = {}
         pnames = {}
-        for i, r in enumerate(self.params):
-            nm = "a%d" % (i + 1)
+        ai = 0
+        for r in self.params:
+            if r == self.this_reg:
+                nm = "this"
+            else:
+                ai += 1
+                nm = "a%d" % ai
             self.param_name[r] = nm
             pnames[(r, 0)] = nm
         self.namer = Namer(func, pnames, self.call_args)
@@ -1018,6 +1033,24 @@ class CGen(object):
         return self.operand(v, depth, sc)
 
 
+    def _this_reg(self):
+        """
+        The register holding the implicit ``this``, or None.
+
+        A non-static member takes the object in r3, so a function whose name
+        puts it directly inside a class scope (``member_class``, established
+        from a vtable/ctor/dtor for that scope -- see data.Members) has ``this``
+        there.  The name is trusted rather than confirmed from use, because use
+        cannot tell the two things apart: a member may ignore the object
+        entirely (its r3 is simply unread), and one that reads a field does so
+        through ``this + offset`` address arithmetic that is indistinguishable
+        from scalar arithmetic on an integer argument.  The residual risk is a
+        *static* member -- a class scope with no object -- printing a spurious
+        ``this``; none occur in the corpus this was built against, and a real
+        decompiler makes the same name-based call.
+        """
+        return regs.ARG_FIRST if self.member_class else None
+
     def _compute_debris(self):
         """
         Dead remnants of a store idiom that a call's operand list pinned.
@@ -1491,8 +1524,14 @@ def _signature(g, func):
     """Return type and parameter list, from the recovered types."""
     plist = []
     for r in g.params:
-        ty = g.types.of((r, 0)) if g.types is not None else None
         nm = g.param_name[r]
+        # The implicit `this` is a pointer to the class, whatever demand
+        # analysis made of r3 (it is usually only forwarded, so it types as a
+        # bare word); the name says what it points at.
+        if r == g.this_reg:
+            plist.append("%s *%s" % (g.member_class, nm))
+            continue
+        ty = g.types.of((r, 0)) if g.types is not None else None
         ct = g.ctype(ty)
         plist.append("%s%s%s" % (ct, "" if ct.endswith("*") else " ", nm))
 
@@ -1509,9 +1548,9 @@ def _signature(g, func):
 
 
 def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
-             stk_of=None):
+             stk_of=None, this_of=None):
     """Render the structured AST as pseudocode lines."""
-    g = CGen(func, name_of, arity_of, str_of, stk_of)
+    g = CGen(func, name_of, arity_of, str_of, stk_of, this_of)
     name = func.name or "sub_%X" % func.start_ea
     ret, params = _signature(g, func)
 

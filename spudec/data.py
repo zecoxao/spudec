@@ -299,6 +299,83 @@ class Names(object):
 
 
 # ---------------------------------------------------------------------------
+# C++ member functions and the implicit `this`
+# ---------------------------------------------------------------------------
+#
+# A non-static member function receives the object as a hidden first argument in
+# r3, but the mangled name does not say so: `lv0::appli_secure_loader::start()`
+# mangles its parameter list as `v` (void) exactly like the free function
+# `lv0::some_ns::start()` does, so the name alone cannot tell a member from a
+# namespaced free/static function.  What settles it is auxiliary evidence that
+# the enclosing scope is a *type*: a vtable, a constructor or a destructor for
+# it.  A scope with any of those is a class, and a function directly inside a
+# class scope is one of its members -- whose r3 is `this`.
+
+
+class Members(object):
+    """
+    Resolves a function to the class it is a member of, or None.
+
+    Builds the set of class scopes once from the whole symbol table (vtables,
+    constructors, destructors), then answers per function by matching the
+    enclosing scope of its demangled name against that set.  Caller confirms
+    the r3 is actually used as a pointer before trusting it as `this`, so a
+    static member -- a class scope with no object -- is not mislabelled.
+    """
+
+    def __init__(self):
+        self._classes = None
+        self._cache = {}
+
+    def _class_set(self):
+        if self._classes is not None:
+            return self._classes
+        classes = set()
+        try:
+            import ida_name
+            import idautils
+        except ImportError:
+            self._classes = classes
+            return classes
+        for ea, raw in idautils.Names():
+            if raw.startswith("_ZTV"):
+                d = ida_name.demangle_name(raw, ida_name.MNG_NODEFINIT)
+                if d:
+                    m = d.split("for'", 1)
+                    if len(m) == 2:
+                        classes.add(_sanitise(m[1].strip().rstrip(">").strip()))
+                continue
+            d = demangle(raw)
+            if not d or "::" not in d:
+                continue
+            scope, last = d.rsplit("::", 1)
+            cls = scope.rsplit("::", 1)[-1]
+            # A constructor is `A::B::B`; a destructor `A::B::~B`.  Either way
+            # the scope `A::B` names a class.
+            if last == cls or last == "~" + cls:
+                classes.add(scope)
+        self._classes = classes
+        return classes
+
+    def __call__(self, ea):
+        """The class `ea` is a member of, or None -- keyed by address."""
+        if ea in self._cache:
+            return self._cache[ea]
+        cls = None
+        try:
+            import ida_name
+            d = demangle(ida_name.get_name(ea))
+        except ImportError:
+            d = None
+        if d and "::" in d:
+            scope = d.rsplit("::", 1)[0]
+            if scope in self._class_set():
+                cls = scope
+        self._cache[ea] = cls
+        return cls
+
+
+# ---------------------------------------------------------------------------
 # shared, per-session resolvers
 # ---------------------------------------------------------------------------
 #
@@ -309,6 +386,7 @@ class Names(object):
 
 _STRINGS = None
 _NAMES = None
+_MEMBERS = None
 
 
 def strings():
@@ -325,8 +403,16 @@ def names():
     return _NAMES
 
 
+def members():
+    global _MEMBERS
+    if _MEMBERS is None:
+        _MEMBERS = Members()
+    return _MEMBERS
+
+
 def clear():
     """Forget everything -- call after retyping data or renaming functions."""
-    global _STRINGS, _NAMES
+    global _STRINGS, _NAMES, _MEMBERS
     _STRINGS = None
     _NAMES = None
+    _MEMBERS = None
