@@ -57,6 +57,12 @@ def decompile(ea, optimize_ir=True, scalarize=True, drop_hints=True,
                                                callee=param_demand)
             func.scalar_stats["scalars"] = _scalarize.mark_scalars(
                 func, func.demand)
+    # Leave SSA before anything renders: a web whose members are live at the
+    # same time cannot share a name, and the merges that no longer hold become
+    # real copies in the IR.  Doing it here rather than in the renderer is
+    # what keeps a copy on an edge whose block the structurer would elide.
+    from . import outssa
+    func.phi_copies = outssa.lower_phis(func)
     func.unhandled = dict(lifter.unhandled)
     func.problems = ssa.verify(func) if check else []
     return func

@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 ".."))
 
 from spudec.ir import Op, EW, Const, Var, Insn, Function     # noqa: E402
-from spudec import regs, ssa, opt, structure, cgen, data, lanes     # noqa: E402
+from spudec import (regs, ssa, opt, structure, cgen, data, lanes,
+                    outssa)     # noqa: E402
 
 
 def word0(v):
@@ -46,6 +47,11 @@ def render(f, str_of=None):
     f.stats = opt.optimize(f)
     problems = ssa.verify(f)
     assert not problems, "after opt:\n" + "\n".join(problems)
+    # As `spudec.decompile` does: leave SSA before rendering, so a web whose
+    # members are live at once is split and its merges become real copies.
+    outssa.lower_phis(f)
+    problems = ssa.verify(f)
+    assert not problems, "after out-of-ssa:\n" + "\n".join(problems)
     stmts, info = structure.structure(f)
     f.structure_info = info
     text = "\n".join(cgen.generate(f, stmts, info,
@@ -514,6 +520,73 @@ def test_stack_slots_print_as_names():
     assert "0x3FFF0" not in text.split("{", 1)[1], (
         "every access to the slot should be named, none left explicit:"
         + chr(10) + text)
+
+
+# ---------------------------------------------------------------------------
+# one name never means two simultaneously live values
+# ---------------------------------------------------------------------------
+
+
+def test_interfering_web_is_split():
+    """
+    Coalescing a phi web is only sound when its members do not overlap.
+
+    Found in sc_iso's `ss::sc_proxy_hdr::make_hdr`, where the IR said
+
+        r9#19  = selb r3#22, r9#18, r11#16
+        t60#1  = r9#1 & 0x3FFF0          <- the incoming pointer
+        mem#20 = storeq mem#19, t60#1, r9#19
+
+    and the listing said
+
+        r9 = selb(..., *(qword *)(r9 & 0x3FFF0), ...);
+        *(qword *)(r9 & 0x3FFF0) = r9;
+
+    whose store address is the value assigned on the line above.  Not untidy
+    -- wrong, and wrong in the way that is hardest to catch by reading.
+
+    Here the phi takes the incoming r3 on one path, and the incoming r3 is
+    still live at the phi because the store uses it as an address.  So the
+    two cannot share a name, and the merge that used to be implicit has to
+    become a real assignment on the edge that supplies it.
+    """
+    R3, R4, R5 = regs.ARG_FIRST, regs.ARG_FIRST + 1, regs.ARG_FIRST + 2
+    M = regs.R_MEM
+    # The address is kept in another register across the branch, exactly as
+    # the compiler did it (`lr r12, r9`); copy propagation then folds r5 away
+    # and the store addresses the incoming r3 directly, which is what makes
+    # its range reach past the phi.
+    f = build("split", [
+        (0x100, [Insn(Op.MOV, Var(R5), [Var(R3)], ew=EW.Q, ea=0x100),
+                 Insn(Op.CJMP, None, [Var(R4)], ea=0x102, aux=(0x108, "z"))]),
+        (0x104, [Insn(Op.JMP, None, [], ea=0x104, aux=0x10C)]),
+        (0x108, [Insn(Op.CONST, Var(R3), [Const(word0(2))], ea=0x108,
+                      scalar=True),
+                 Insn(Op.JMP, None, [], ea=0x10A, aux=0x10C)]),
+        (0x10C, [
+            Insn(Op.STOREQ, Var(M), [Var(M), Var(R5), Var(R3)], ew=EW.Q,
+                 ea=0x10C),
+            Insn(Op.RET, None, [Var(M), Var(regs.R_CH)], ea=0x110),
+        ]),
+    ], [(0, 1), (0, 2), (1, 3), (2, 3)])
+
+    text = render(f)
+    show("an interfering web is split", text)
+
+    body = [l.strip() for l in text.split(chr(10) + "{" + chr(10), 1)[1]
+            .splitlines() if l.strip().endswith(";")]
+    store = [l for l in body if l.startswith("*")]
+    assert store, "expected a store:" + chr(10) + text
+    lhs, rhs = store[0].split(" = ", 1)
+    assert "a1" in lhs, (
+        "the address should still be the incoming r3:" + chr(10) + text)
+    assert "a1" not in rhs, (
+        "the stored value is the merged one, not the parameter:"
+        + chr(10) + text)
+    # ...and the path that used to supply the incoming value implicitly now
+    # says so, in an arm the structurer had elided while it was empty.
+    assert "r3 = a1;" in text, (
+        "the split web needs its merge spelled out:" + chr(10) + text)
 
 
 # ---------------------------------------------------------------------------

@@ -5,13 +5,15 @@ Three things happen here, none of which touch the SSA IR -- this is a
 *rendering*, so `spudec.dump()` still shows the verifiable three-address form
 underneath and the SSA verifier still applies to it.
 
-**Phi-web coalescing.** Structured code has no place for phi nodes: the
-control flow that selects between their arguments is now explicit. Each phi
-web (the transitive closure of a phi's result and arguments) is given one
-name, so `r33#2 = phi(r33#1, r33#7)` disappears and every member prints as
-`r33`. Distinct webs of the same register get `_2`, `_3` suffixes rather than
-being conflated, so two unrelated uses of r33 never silently become one
-variable.
+**Naming.** Structured code has no place for phi nodes: the control flow that
+selects between their arguments is now explicit. So a phi web (the transitive
+closure of a phi's result and arguments) prints as one name, and
+`r33#2 = phi(r33#1, r33#7)` disappears -- but only as far as the members'
+live ranges allow. :mod:`outssa` colours each web against the interference
+graph and turns the merges that no longer hold into copies; this module names
+the colours it produced. Distinct webs, and distinct colours within one web,
+get `_2`, `_3` suffixes rather than being conflated, so two values that are
+live at the same time never share a name.
 
 **Expression inlining.** A definition with exactly one use, in the same block,
 with no side effect in between, is folded into its use site. This is what
@@ -34,7 +36,7 @@ No IDA imports; pass ``name_of`` to resolve call targets to real symbol names.
 
 from .ir import (Op, EW, OP_NAME, INFIX, MEM_READS, MEM_WRITES, ABI_OPS,
                  EW_SUFFIX)
-from . import regs, channels, types, frame
+from . import regs, channels, types, frame, outssa
 from .structure import (Basic, If, Loop, Break, Continue, Goto, Label,
                         Return, Tail)
 
@@ -70,10 +72,12 @@ _BITWISE = {
 
 class Namer(object):
 
-    def __init__(self, func, param_names=None):
+    def __init__(self, func, param_names=None, call_args=None):
         self._parent = {}
         self._name = {}
+        self._colours = []
         self._fixed = dict(param_names or {})
+        self._call_args = call_args
         self._build(func)
 
     def _find(self, k):
@@ -90,11 +94,14 @@ class Namer(object):
             self._parent[rb] = ra
 
     def webs(self):
-        """The groups of SSA keys that print as one variable."""
-        out = {}
-        for k in self._parent:
-            out.setdefault(self._find(k), set()).add(k)
-        return list(out.values())
+        """
+        The groups of SSA keys that print as one variable.
+
+        The colours, not the phi webs: type inference unifies over these, and
+        a web that had to be split carries two variables with two independent
+        types.  Returning the web would have unified them again.
+        """
+        return [set(c) for c in self._colours]
 
     def _build(self, func):
         keys = []
@@ -120,23 +127,45 @@ class Namer(object):
         for k in sorted(self._parent, key=lambda x: (x[0], x[1])):
             webs.setdefault(self._find(k), []).append(k)
 
+        # ...but a web is only safe to print as one variable if no two of its
+        # members are live at the same time.  Where they are, one name would
+        # mean two things, and the listing reads the wrong one:
+        #
+        #     r9#19  = selb r3#22, r9#18, r11#16
+        #     t60#1  = r9#1 & 0x3FFF0        <- the incoming pointer
+        #     mem#20 = storeq mem#19, t60#1, r9#19
+        #
+        # printed as `*(qword *)(r9 & 0x3FFF0) = r9;`, whose address is now
+        # the value assigned on the line above.  So each web is coloured: a
+        # member joins an existing colour only if it interferes with none of
+        # that colour's members, and the phis that no longer hold within one
+        # colour are printed rather than suppressed (see `_suppressed`).
+        colour, _groups = outssa.colours(func, self._call_args)
+
         seen = {}
         for root in sorted(webs, key=lambda r: (r[0], r[1])):
-            members = webs[root]
-            # A web containing the function's incoming value for an argument
-            # register is that parameter, and takes its positional name.
-            fixed = next((self._fixed[k] for k in sorted(members)
-                          if k in self._fixed), None)
-            if fixed is not None:
+            by_colour = {}
+            for k in sorted(webs[root]):
+                by_colour.setdefault(colour.get(k, ("?", k)), []).append(k)
+            colours = [by_colour[c] for c in sorted(by_colour, key=str)]
+            # The colour holding the function's incoming value for an argument
+            # register is that parameter, and takes its positional name; a
+            # later, interfering reuse of the same register is not the
+            # parameter and must not borrow its name.
+            self._colours.extend(colours)
+            for members in colours:
+                fixed = next((self._fixed[k] for k in sorted(members)
+                              if k in self._fixed), None)
+                if fixed is not None:
+                    for k in members:
+                        self._name[k] = fixed
+                    continue
+                base = regs.reg_name(root[0])
+                n = seen.get(base, 0) + 1
+                seen[base] = n
+                nm = base if n == 1 else "%s_%d" % (base, n)
                 for k in members:
-                    self._name[k] = fixed
-                continue
-            base = regs.reg_name(root[0])
-            n = seen.get(base, 0) + 1
-            seen[base] = n
-            nm = base if n == 1 else "%s_%d" % (base, n)
-            for k in members:
-                self._name[k] = nm
+                    self._name[k] = nm
 
     def name(self, var):
         return self._name.get(var.key(), str(var))
@@ -306,7 +335,7 @@ class CGen(object):
             nm = "a%d" % (i + 1)
             self.param_name[r] = nm
             pnames[(r, 0)] = nm
-        self.namer = Namer(func, pnames)
+        self.namer = Namer(func, pnames, self.call_args)
         # Argument setup may fold into the call now that the call shows its
         # arguments -- but only for operands that are actually rendered.  A
         # register set before a call the callee never reads must stay a
@@ -341,6 +370,17 @@ class CGen(object):
         self.stack_unresolved = 0
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
+        # Names some visible definition really assigns.  A printed phi can
+        # otherwise name a value whose every definition is suppressed -- a
+        # colour made only of other phis and muted clobbers -- and the listing
+        # then mentions a variable nothing declares or computes.
+        self.visible = set()
+        for insn in func.insns():
+            d = insn.defines()
+            if d is None or d.reg in regs.PSEUDO:
+                continue
+            if not self._suppressed(insn, d):
+                self.visible.add(self.namer.name(d))
         # Recover types now rather than earlier in the pipeline: inference has
         # to unify across the namer's webs, since everything printed under one
         # variable name must end up with one type.
@@ -476,7 +516,7 @@ class CGen(object):
         if op == Op.UNDEF:
             return "<clobbered by call>"
         if op == Op.PHI:
-            return "phi(%s)" % ", ".join(self.operand(s, depth, sc)
+            return "phi(%s)" % ", ".join(self._phi_arg(s, depth, sc)
                                          for s in insn.srcs)
         if op in (Op.LOAD, Op.LOADQ, Op.LOADU):
             return self._deref(insn, depth)
@@ -569,7 +609,15 @@ class CGen(object):
         name = OP_NAME.get(op, "op%d" % int(op))
         if op in _EW_CALLS:
             name += "." + EW_SUFFIX[insn.ew]
-        args = ", ".join(self.operand(s, depth, sc) for s in insn.srcs)
+        # A shift or rotate count is read from the preferred slot only, so it
+        # is a number -- `qrotmby(r2, 4)`.  Printing the operand as the
+        # quadword it technically is gave
+        # `qrotmby(r2, #0x00000004000000000000000000000000)`, which buries a 4
+        # in thirty-one zeroes and reads as though the whole register mattered.
+        args = ", ".join(
+            self.operand(s, depth, sc or (op in _COUNT_OPS and i == 1),
+                         want_scalar=(op in _COUNT_OPS and i == 1))
+            for i, s in enumerate(insn.srcs))
         if insn.aux is not None and op not in (Op.CALL,):
             args = args + (", " if args else "") + "/*%s*/" % (insn.aux,)
         return "%s(%s)" % (name, args)
@@ -925,6 +973,46 @@ class CGen(object):
 
     # -- statements --------------------------------------------------------
 
+    def _trivial_phi(self, insn):
+        """
+        Whether this phi needs no statement of its own.
+
+        :func:`outssa.lower_phis` has already inserted a copy for every
+        argument whose name differs from the result's, except on an edge that
+        is critical in both directions -- there is nowhere to put one there
+        without splitting the edge.  Those are what still print.
+        """
+        d = insn.defines()
+        if d is None:
+            return True
+        nm = self.namer.name(d)
+        return all(not s.is_var or self.namer.name(s) == nm
+                   for s in insn.srcs)
+
+    def _phi_arg(self, v, depth, sc):
+        """
+        One argument of a printed phi.
+
+        An argument whose definition is a muted call clobber has no name in
+        the listing -- that is what muting means -- so printing its name left
+        the phi mentioning a variable nothing declared.  It is an unknown
+        value, and `<clobbered by call>` is how the rest of the listing says
+        so.
+
+        The same applies, less obviously, to an argument whose *colour* has no
+        visible definition at all: a merge of other phis and muted clobbers
+        reaches this point with no assignment anywhere in the function.  Three
+        functions in the corpus did that.  An incoming value is different --
+        version 0 arrives with a value and is declared as live in.
+        """
+        if v.is_var and v.key() in self.mute:
+            return "<clobbered by call>"
+        if v.is_var and v.ver != 0 \
+                and self.namer.name(v) not in self.visible:
+            return "<unknown>"
+        return self.operand(v, depth, sc)
+
+
     def _suppressed(self, insn, d):
         """
         Whether this definition never reaches the output at all.
@@ -936,7 +1024,7 @@ class CGen(object):
         declared and never mentioned again for exactly that reason.
         """
         if insn.op == Op.PHI:
-            return True
+            return self._trivial_phi(insn)
         if insn.op == Op.UNDEF:
             # A clobber nothing real reads is noise; one in a return-value
             # register at a call site does print, as `<result in rN>`.
@@ -954,7 +1042,7 @@ class CGen(object):
     def insn_stmt(self, insn):
         """One IR instruction as a statement, or None if it is absorbed."""
         op = insn.op
-        if op == Op.PHI:
+        if op == Op.PHI and self._trivial_phi(insn):
             return None                       # control flow expresses it now
         d = insn.defines()
         if d is not None and d.key() in self.inlinable:
@@ -1103,6 +1191,12 @@ class CGen(object):
                 return "return %s;" % self.nm(s)
         return "return;"
 
+
+# Operations whose second operand is a shift or rotate *count*, which the
+# hardware reads from the preferred slot: it is a number, not a quadword.
+_COUNT_OPS = frozenset((
+    Op.QROTBY, Op.QROTBI, Op.QROTMBY, Op.QROTMBI, Op.QSHLBY, Op.QSHLBI,
+))
 
 _EW_CALLS = frozenset((
     Op.ADD, Op.SUB, Op.MUL, Op.CG, Op.BG, Op.ADDX, Op.SUBX, Op.CGX, Op.BGX,
