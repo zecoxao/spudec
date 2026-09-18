@@ -1306,8 +1306,12 @@ class CGen(object):
                 out.append(pad + self._return(st.insn))
             elif isinstance(st, Tail):
                 if st.insn.op == Op.IJMP:
-                    out.append("%sgoto *%s;   // indirect / tail call"
-                               % (pad, self.operand(st.insn.srcs[0], 0, True)))
+                    blk = st.insn.block
+                    kind = ("jump table" if blk is not None
+                            and len(blk.succs) > 1 else "indirect / tail call")
+                    out.append("%sgoto *%s;   // %s"
+                               % (pad, self.operand(st.insn.srcs[0], 0, True),
+                                  kind))
                 elif st.insn.op == Op.JMP:
                     out.append("%sgoto loc_%X;   // outside this function"
                                % (pad, st.insn.aux))

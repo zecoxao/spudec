@@ -431,7 +431,23 @@ def _stmts(b, stop, ctx, depth=0, skip_control=None):
             return out
         elif term.op == Op.IJMP:
             out.append(Tail(term))
-            return out
+            if not cur.succs:
+                return out              # unresolved indirect jump / tail call
+            # A resolved switch: IDA's jump table gave every case as a real
+            # successor (cfg wired them).  Emit each so it is reached and
+            # structured, then continue at the shared follow -- otherwise the
+            # `goto *rN` would strand every case block and the listing would
+            # report a pile of "block(s) not reached" holding real code.  Each
+            # case is labelled so the computed jump reads against its targets.
+            f = ctx.if_follow(cur, stop)
+            for s in cur.succs:
+                ctx.labels.add(s.id)
+                out.extend(_stmts(s, f, ctx, depth + 1))
+            if f is None or f is stop:
+                return out
+            cur = f
+            first = False
+            continue
         elif term.op == Op.JMP and not cur.succs:
             out.append(Tail(term))          # leaves the function
             return out
