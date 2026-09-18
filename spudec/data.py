@@ -224,6 +224,16 @@ def _sanitise(name):
     return out.strip("_") or name
 
 
+# An operator's spelling *is* its name: `operator==`, `operator&`, `operator()`,
+# `operator delete`.  Those symbols are exactly what `_sanitise` would strip,
+# which collapsed `operator==` and `operator!=` to a bare `operator` -- so the
+# two then shared a name and each got its address appended.  `operator` here is
+# a whole word (anchored at the string start or a `::`, and not the tail of an
+# identifier like `cooperator`), followed by a non-identifier character.
+import re as _re
+_OPERATOR_RE = _re.compile(r"(?:^|::)operator(?![A-Za-z0-9_])")
+
+
 def demangle(name):
     """The qualified C++ name without its parameter list, or None."""
     if not name:
@@ -235,9 +245,14 @@ def demangle(name):
     d = ida_name.demangle_name(name, ida_name.MNG_NODEFINIT)
     if not d or d == name:
         return None
-    # Defensive: if a parameter list survived, cut it.  `operator()` is the
-    # one name where the parentheses are part of the name itself.
-    if "(" in d and "operator" not in d:
+    # An operator keeps its spelling verbatim -- the symbols are the name, and
+    # they read in a call exactly as a real decompiler prints them
+    # (`lv0::uint256_t::operator==(a, b)`).  Its own `()`/`[]` is part of the
+    # name, not a parameter list, so no cut is attempted.
+    if _OPERATOR_RE.search(d):
+        return d
+    # Defensive: if a parameter list survived, cut it.
+    if "(" in d:
         d = d.split("(", 1)[0].rstrip()
     return _sanitise(d)
 
