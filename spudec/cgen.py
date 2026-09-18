@@ -370,6 +370,11 @@ class CGen(object):
         self.stack_unresolved = 0
         self.call_at = {i.ea: i for i in func.insns()
                         if i.op in (Op.CALL, Op.ICALL)}
+        # Definitions kept alive only by a known-arity call's conservative ABI
+        # operand list, read by nothing real -- dead idiom debris (see
+        # `_compute_debris`).  Computed before `visible`, which asks
+        # `_suppressed`, which consults it.
+        self.debris = self._compute_debris()
         # Names some visible definition really assigns.  A printed phi can
         # otherwise name a value whose every definition is suppressed -- a
         # colour made only of other phis and muted clobbers -- and the listing
@@ -1013,6 +1018,99 @@ class CGen(object):
         return self.operand(v, depth, sc)
 
 
+    def _compute_debris(self):
+        """
+        Dead remnants of a store idiom that a call's operand list pinned.
+
+        The SPU lifter names r3..r10 on every call because a callee *might*
+        read them, which is what stops DCE from deleting genuine argument setup
+        before any arity is known.  By the time this runs the arity *is* known,
+        so an operand a known-arity call does not actually take is not an
+        argument.  ``recover_stores`` relies on that: folding a
+        ``cwd``/``lqd``/``shufb``/``stqd`` group into one scalar store orphans
+        the old-quadword reload and the insert mask, and when a call follows --
+        a constructor invoking a method on the object it has just built is the
+        usual case -- their registers sit in that call's operand list and
+        survive DCE.  Printing them puts back the very lines scalarisation
+        removed, ``r7 = var_20; r6 = genctl.w(sp_2);`` around a scalar store
+        that already says everything.
+
+        Scope is deliberately narrow.  The candidates are only the values
+        ``recover_stores`` recorded as feeding a dismantled shufb (and their
+        own address arithmetic, reached backwards), never dead values in
+        general -- a genuinely dead load the reader put there stays visible.
+        And a candidate is dropped only when a full, arity-aware liveness finds
+        nothing real reads it: an unknown-arity call keeps *all* of its
+        operands, so a value some indeterminate callee might take is never
+        removed even if it did feed the idiom.
+        """
+        roots = getattr(self.func, "store_idiom_roots", None)
+        if not roots:
+            return set()
+        defs = self.defs
+
+        # 1. Arity-aware liveness: what a real reader (or a call that really
+        #    passes it) keeps alive.  A call/return keeps only its genuine
+        #    operands; every other instruction keeps its operands once its own
+        #    result is kept.
+        kept = set()
+
+        def keeping(insn):
+            op = insn.op
+            if op in ABI_OPS:
+                keep = list(insn.srcs[:ABI_OPS[op]])      # indirect target
+                if op == Op.CALL:
+                    n = (self.arity_of(insn.aux)
+                         if self.arity_of is not None and insn.aux is not None
+                         else None)
+                    keep += (call_arguments(insn, n) or []) if n is not None \
+                        else list(insn.srcs)              # unknown: keep all
+                elif op in (Op.ICALL, Op.IJMP):
+                    keep += list(insn.srcs)               # callee/target opaque
+                elif op == Op.RET:
+                    keep += [s for s in insn.srcs if s.is_var
+                             and s.reg == regs.ARG_FIRST and s.ver != 0]
+                return keep
+            if op.has_side_effects or op.is_terminator:
+                return insn.srcs
+            d = insn.defines()
+            return insn.srcs if d is not None and d.key() in kept else []
+
+        changed = True
+        while changed:
+            changed = False
+            for insn in self.func.insns():
+                for u in keeping(insn):
+                    if u.is_var and u.key() in defs and u.key() not in kept:
+                        kept.add(u.key())
+                        changed = True
+
+        dead = {k for k, insn in defs.items()
+                if k not in kept and not insn.op.has_side_effects
+                and not insn.op.is_terminator
+                and insn.op not in (Op.PHI, Op.UNDEF)}
+
+        # 2. Keep only the idiom's own cone: the recorded roots, plus the
+        #    address arithmetic that fed them and nothing live.
+        cone = set(roots) & dead
+        frontier = list(cone)
+        while frontier:
+            insn = defs.get(frontier.pop())
+            if insn is None:
+                continue
+            for u in insn.uses():
+                if u.key() in dead and u.key() not in cone:
+                    cone.add(u.key())
+                    frontier.append(u.key())
+        # The inserted value reaches the shufb by way of an `ila`, whose
+        # constant folds into the scalar store before this idiom is even
+        # matched -- so the store spells it inline and the `ila` is left as a
+        # dead `r5 = #0x2e698:w4` the call's operand list still pins.  A dead
+        # constant read by nothing real carries no information wherever it sits,
+        # so drop those too (only loads need the cone's provenance).
+        cone |= {k for k in dead if defs[k].op == Op.CONST}
+        return cone
+
     def _suppressed(self, insn, d):
         """
         Whether this definition never reaches the output at all.
@@ -1025,6 +1123,9 @@ class CGen(object):
         """
         if insn.op == Op.PHI:
             return self._trivial_phi(insn)
+        # Dead idiom debris a known-arity call's operand list pinned past DCE.
+        if d is not None and d.key() in self.debris:
+            return True
         if insn.op == Op.UNDEF:
             # A clobber nothing real reads is noise; one in a return-value
             # register at a call site does print, as `<result in rN>`.

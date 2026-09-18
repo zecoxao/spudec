@@ -392,9 +392,26 @@ def recover_stores(func, strict=False):
             if m is not None:
                 matches.append((insn, m))
 
+    # The values that fed the dismantled cwd/lqd/shufb: the inserted scalar,
+    # the old-quadword reload and the insert mask.  Once the merge is a scalar
+    # store the shufb is dead and DCE takes it, but the reload and the mask can
+    # be pinned past DCE by a following call's conservative operand list -- a
+    # constructor that immediately calls a method on the object it just built
+    # is the usual case.  The renderer suppresses whatever of these is dead
+    # (see cgen._compute_debris); recording the roots keeps that strictly
+    # scoped to this idiom rather than to dead values in general.
+    roots = getattr(func, "store_idiom_roots", None)
+    if roots is None:
+        roots = func.store_idiom_roots = set()
+
     n = assumed = 0
     for insn, m in matches:
         ctl, val, addr, hazards, slot = m
+        shuf = defs.get(insn.srcs[2].key()) if insn.srcs[2].is_var else None
+        if shuf is not None:
+            for s in shuf.srcs:
+                if s.is_var:
+                    roots.add(s.key())
         if addr is None:
             addr = _offset_addr(func, insn, insn.srcs[1], slot)
         insn.op = Op.STORE
