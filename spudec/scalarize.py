@@ -328,7 +328,13 @@ def _chain_hazards(store_mem, load_mem, defs, target, limit=64):
         if cur.key() == load_mem.key():
             return hazards
         d = defs.get(cur.key())
-        if d is None or d.op == Op.PHI or d.op not in _MEM_DEFS:
+        if d is None:
+            return None
+        if d.op == Op.PHI:
+            if cur.key() == store_mem.key():
+                return hazards
+            return None
+        if d.op not in _MEM_DEFS:
             return None
         if d.op in (Op.STOREQ, Op.STORE):
             if not _disjoint(addr_expr(d.srcs[1], defs), target, defs):
@@ -480,7 +486,91 @@ def _match_load(insn, defs):
 # ---------------------------------------------------------------------------
 
 
+def hoist_phi_shufb(func):
+    """
+    When multiple branches each compute a value to insert into the same quadword
+    using the same element width and control mask (e.g. word store in if/else),
+    the values merge in a PHI that feeds a single store:
+        r2#phi = phi(shufb(v1, base, ctl), shufb(v2, base, ctl), ...)
+        storeq mem, addr, r2#phi
+    Hoist the PHI to the scalar values so the store can be scalarized:
+        v#phi = phi(v1, v2, ...)
+        r2#phi = shufb(v#phi, base, ctl)
+    """
+    defs = _defmap(func)
+    max_ver = {}
+    for i in func.insns():
+        for v in [i.dst] + i.srcs:
+            if v and v.is_var:
+                max_ver[v.reg] = max(max_ver.get(v.reg, 0), v.ver)
+
+    changed = False
+    for b in func.blocks:
+        for insn in b.insns:
+            if insn.op == Op.PHI and insn.dst and insn.dst.reg != 128:
+                shufs = []
+                for s in insn.srcs:
+                    if s.is_var and s.key() in defs:
+                        d = defs[s.key()]
+                        if d.op == Op.SHUFB and len(d.srcs) == 3:
+                            shufs.append(d)
+                if len(shufs) == len(insn.srcs) and len(shufs) >= 2:
+                    ctl0 = defs.get(shufs[0].srcs[2].key()) if shufs[0].srcs[2].is_var else None
+                    if not ctl0 or ctl0.op != Op.GENCTL:
+                        continue
+                    ca0 = addr_expr(ctl0.srcs[0], defs)
+                    slot0 = _slot_of(ca0)
+                    compatible = True
+                    for sh in shufs[1:]:
+                        ctli = defs.get(sh.srcs[2].key()) if sh.srcs[2].is_var else None
+                        if not ctli or ctli.op != Op.GENCTL or ctli.ew != ctl0.ew:
+                            compatible = False
+                            break
+                        cai = addr_expr(ctli.srcs[0], defs)
+                        sloti = _slot_of(cai)
+                        if slot0 is not None and sloti is not None:
+                            if slot0 != sloti:
+                                compatible = False
+                                break
+                        elif not _same_slot(ca0, cai, defs):
+                            compatible = False
+                            break
+                    if not compatible:
+                        continue
+
+                    base0 = shufs[0].srcs[1]
+                    ld0 = defs.get(base0.key()) if base0.is_var else None
+                    if not ld0 or ld0.op != Op.LOADQ:
+                        continue
+                    la0 = addr_expr(ld0.srcs[1], defs)
+                    for sh in shufs[1:]:
+                        basei = sh.srcs[1]
+                        ldi = defs.get(basei.key()) if basei.is_var else None
+                        if not ldi or ldi.op != Op.LOADQ:
+                            compatible = False
+                            break
+                        lai = addr_expr(ldi.srcs[1], defs)
+                        if not _same_base(la0[0], lai[0], defs) or la0[1] != lai[1]:
+                            compatible = False
+                            break
+                    if not compatible:
+                        continue
+
+                    target_reg = shufs[0].srcs[0].reg if shufs[0].srcs[0].is_var else (insn.dst.reg if insn.dst.reg > 2 else 100)
+                    nv = max_ver.get(target_reg, 0) + 1
+                    max_ver[target_reg] = nv
+                    new_phi_dst = Var(target_reg, nv)
+                    scalar_phi = Insn(Op.PHI, new_phi_dst, [sh.srcs[0] for sh in shufs], ea=insn.ea)
+                    scalar_phi.block = b
+                    b.insns.insert(b.insns.index(insn), scalar_phi)
+                    insn.op = Op.SHUFB
+                    insn.srcs = [new_phi_dst, shufs[0].srcs[1], shufs[0].srcs[2]]
+                    changed = True
+    return changed
+
+
 def recover_stores(func, strict=False):
+    hoist_phi_shufb(func)
     defs = _defmap(func)
     # Match everything first: rewriting can insert an address computation,
     # which would shift a block's instruction list mid-iteration.

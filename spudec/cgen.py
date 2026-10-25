@@ -35,7 +35,7 @@ No IDA imports; pass ``name_of`` to resolve call targets to real symbol names.
 """
 
 from .ir import (Op, EW, OP_NAME, INFIX, MEM_READS, MEM_WRITES, ABI_OPS,
-                 EW_SUFFIX)
+                 EW_SUFFIX, Var)
 from . import regs, channels, types, frame, outssa
 from .structure import (Basic, If, Loop, Break, Continue, Goto, Label,
                         Return, Tail)
@@ -184,6 +184,21 @@ class Namer(object):
 
     def name(self, var):
         return self._name.get(var.key(), str(var))
+
+
+def _get_const_addr(v, defs):
+    if v.is_const:
+        val = v.val
+        if (val >> 96) > 0:
+            return (val >> 96) & 0xFFFF
+        return val & 0xFFFF
+    if v.is_var and v.key() in defs:
+        d = defs[v.key()]
+        if d.op in (Op.CONST, Op.MOV) and len(d.srcs) >= 1:
+            return _get_const_addr(d.srcs[0], defs)
+        if d.op in (Op.LOAD, Op.LOADQ) and len(d.srcs) >= 2:
+            return _get_const_addr(d.srcs[1], defs)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +664,62 @@ class CGen(object):
                             want_scalar=want_scalar, strings=strings)
         return self.nm(v)
 
+    def _stack_indexed_addr(self, v, depth=0):
+        if self._slots is None:
+            self._slots = self._slot_types()
+        if not self._slots:
+            return None
+        from .scalarize import addr_expr, word0
+
+        cur = v
+        if cur.is_var and cur.key() in self.defs:
+            d = self.defs[cur.key()]
+            if (d.op == Op.AND and len(d.srcs) == 2 and d.srcs[1].is_const
+                    and word0(d.srcs[1].val) in (0x3FFF0, 0x3FFFF)):
+                cur = d.srcs[0]
+
+        if not (cur.is_var and cur.key() in self.defs):
+            return None
+        d = self.defs[cur.key()]
+        if d.op != Op.ADD or d.ew != EW.W or len(d.srcs) != 2:
+            return None
+
+        sp_in = (regs.SP, 0)
+        s1, s2 = d.srcs
+        for sp_term, idx_term in [(s1, s2), (s2, s1)]:
+            b_sp, off_sp, _ = addr_expr(sp_term, self.defs)
+            if b_sp == sp_in:
+                b_idx, off_idx, _ = addr_expr(idx_term, self.defs)
+                if b_idx is not None and b_idx != sp_in:
+                    tot_off = (off_sp + off_idx) & 0xFFFFFFFF
+                    slot_base = tot_off & ~0xF
+                    byte_off = tot_off & 0xF
+                    hit = self._slots.get((b_sp, slot_base))
+                    if hit is None:
+                        hit = self._slots.get((b_sp, tot_off))
+                        byte_off = 0
+                    if hit is None:
+                        from . import frame
+                        signed_off = frame.signed_offset(slot_base)
+                        if signed_off != 0 and -0x4000 <= signed_off <= 0x200:
+                            name = "var_%X" % abs(signed_off) if signed_off < 0 else "arg_%X" % signed_off
+                            hit = (name, "qword", EW.Q)
+                            self._slots[(b_sp, slot_base)] = hit
+                    if hit is not None:
+                        self.stack_decls[hit[0]] = hit[1]
+                        slot_name = self.user_renames.get(hit[0], hit[0])
+                        idx_var = Var(b_idx[0], b_idx[1])
+                        idx_str = self.operand(idx_var, depth, True, want_scalar=True)
+                        if byte_off == 0:
+                            return "(char *)&%s + %s" % (slot_name, idx_str)
+                        else:
+                            return "(char *)&%s + %s + 0x%X" % (slot_name, idx_str, byte_off)
+        return None
+
     def addr(self, v, depth=0, strings=True):
+        stk_idx = self._stack_indexed_addr(v, depth)
+        if stk_idx is not None:
+            return stk_idx
         if v.is_const:
             if strings:
                 lit = self.str_of(v.val >> 96)
@@ -672,6 +742,13 @@ class CGen(object):
     def rhs(self, insn, depth=0, top=True, want_scalar=False, strings=True):
         op = insn.op
         sc = insn.scalar
+
+        d = insn.defines()
+        if d is not None and hasattr(self, 'sbox_trees') and d.key() in self.sbox_trees:
+            inp_var, is_inv, tree_insns, mask_insn = self.sbox_trees[d.key()]
+            op_name = "aes_inv_sub_bytes" if is_inv else "aes_sub_bytes"
+            inp_str = self.operand(inp_var, depth, False)
+            return "%s(%s)" % (op_name, inp_str)
 
         # An address computed into a named slot is that slot's address.  This
         # is what connects the two halves of the common idiom: a pointer into
@@ -907,7 +984,96 @@ class CGen(object):
                 return text if top else "(%s)" % text
 
         if op == Op.SHUFB and len(insn.srcs) == 3:
-            mask_str = self.operand(insn.srcs[2], depth, False)
+            mask_op = insn.srcs[2]
+            addr = _get_const_addr(mask_op, self.defs)
+            mask_val = mask_op.val if mask_op.is_const else None
+            mask_w0 = (mask_val & 0xFFFFFFFF) if mask_val is not None else None
+            mask_str = self.operand(mask_op, depth, False)
+
+            # RotWord masks (32-bit rotate left by 8)
+            if mask_w0 in (0x15161714, 0x1D1E1F1C):
+                rb_str = self.operand(insn.srcs[1], depth, False, want_scalar=True)
+                return "_rotl(%s, 8)" % rb_str
+            if mask_w0 == 0x0D0E0F0C:
+                ra_str = self.operand(insn.srcs[0], depth, False, want_scalar=True)
+                return "_rotl(%s, 8)" % ra_str
+
+            # Word extraction masks
+            if mask_w0 == 0x1C1D1E1F:
+                rb_str = self.operand(insn.srcs[1], depth, False, want_scalar=True)
+                return "(u32)%s" % rb_str
+            if mask_w0 in (0x00010203, ) or "10203" in mask_str:
+                return self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+            if mask_w0 == 0x04050607 or "4050607" in mask_str:
+                ra_str = self.operand(insn.srcs[0], depth, False)
+                return "%s[1]" % ra_str
+            if mask_w0 == 0x08090A0B or "8090a0b" in mask_str.lower():
+                ra_str = self.operand(insn.srcs[0], depth, False)
+                return "%s[2]" % ra_str
+            if mask_w0 == 0x0C0D0E0F or "c0d0e0f" in mask_str.lower():
+                ra_str = self.operand(insn.srcs[0], depth, False)
+                return "%s[3]" % ra_str
+
+            # Byte splat mask (e.g. memset)
+            if mask_w0 == 0x03030303 or "3030303" in mask_str:
+                ra_str = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+                return "spu_splats((u8)%s)" % ra_str
+
+            # Known table addresses / crypto constants
+            if addr is not None:
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                b_str = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+                if addr == 0xCAE0:
+                    if "DecKey" in getattr(self.func, "name", ""):
+                        return "aes_inv_mix_columns(%s)" % a_str
+                    return "aes_shift_rows(%s)" % a_str
+                elif addr == 0xCAF0:
+                    return "aes_mix_cols_rot(%s, 1)" % a_str
+                elif addr == 0xCB00:
+                    return "aes_mix_cols_rot(%s, 2)" % a_str
+                elif addr == 0xCB10:
+                    return "aes_mix_cols_rot(%s, 3)" % a_str
+                elif addr == 0xCC30:
+                    if "DecKey" in getattr(self.func, "name", ""):
+                        return "aes_mix_columns(%s)" % a_str
+                    return "aes_inv_shift_rows(%s)" % a_str
+                elif addr == 0xCC40:
+                    return "aes_inv_mix_cols_rot(%s, 1)" % a_str
+                elif addr == 0xCC50:
+                    return "aes_inv_mix_cols_rot(%s, 2)" % a_str
+                elif addr == 0xCC60:
+                    return "aes_inv_mix_cols_rot(%s, 3)" % a_str
+                elif addr == 0xCB20:
+                    m_str = self.operand(insn.srcs[2], depth, False)
+                    return "aes_xtimes_table(%s)" % m_str
+                elif addr == 0xCC70:
+                    m_str = self.operand(insn.srcs[2], depth, False)
+                    return "aes_xtimes2_table(%s)" % m_str
+                elif addr == 0xCC80:
+                    m_str = self.operand(insn.srcs[2], depth, False)
+                    return "aes_xtimes3_table(%s)" % m_str
+                elif addr == 0xCCF0:
+                    text = "(%s << 32) | (%s >> 96)" % (a_str, b_str)
+                    return text if top else "(%s)" % text
+                elif addr == 0xCAD0:
+                    text = "(%s << 64) | (%s >> 64)" % (a_str, b_str)
+                    return text if top else "(%s)" % text
+                elif addr == 0xCAC0:
+                    text = "((u64)%s << 64) | (u64)%s" % (a_str, b_str)
+                    return text if top else "(%s)" % text
+                elif addr == 0xCA80:
+                    text = "%s << 32" % a_str
+                    return text if top else "(%s)" % text
+                elif addr == 0xCA90:
+                    text = "%s << 64" % a_str
+                    return text if top else "(%s)" % text
+                elif addr == 0xCAA0:
+                    text = "%s >> 32" % a_str
+                    return text if top else "(%s)" % text
+                elif addr == 0xCAB0:
+                    text = "%s >> 64" % a_str
+                    return text if top else "(%s)" % text
+
             if ("xmmword_232A0" in mask_str or "xmmword_232B0" in mask_str) or (
                     insn.srcs[0].is_var and insn.srcs[1].is_var and insn.srcs[0].key() == insn.srcs[1].key()
                     and ("232A0" in mask_str or "232B0" in mask_str)):
@@ -915,8 +1081,6 @@ class CGen(object):
                 if not ra_str.isidentifier() and not (ra_str.startswith("(") and ra_str.endswith(")")):
                     ra_str = "(%s)" % ra_str
                 return "(u32)%s" % ra_str
-            if (insn.srcs[2].is_const and (insn.srcs[2].val & 0xFFFFFFFF) == 0x00010203) or "10203" in mask_str:
-                return self.operand(insn.srcs[0], depth, sc, want_scalar=True)
             if "233B0" in mask_str:
                 ra_str = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
                 return "__builtin_bswap32(%s)" % ra_str
@@ -936,22 +1100,45 @@ class CGen(object):
             if any(k in mask_str for k in ("23910", "23920", "23930", "23940")):
                 a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
                 return "aes_inv_shift_rows(%s)" % a_str
+            if any(k in mask_str for k in ("CAE0", "cae0")):
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                return "aes_inv_mix_columns(%s)" % a_str
             if insn.srcs[2].is_var and insn.srcs[2].key() in self.defs:
                 c_insn = self.defs[insn.srcs[2].key()]
                 if c_insn.op == Op.GENCTL:
                     val_s = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
                     old_s = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+                    from .scalarize import addr_expr, word0, _slot_of
+                    ca = addr_expr(c_insn.srcs[0], self.defs)
+                    slot = _slot_of(ca)
+                    if slot is not None:
+                        if c_insn.ew == EW.W:
+                            idx = slot // 4
+                            if old_s == "0":
+                                if idx == 0:
+                                    return val_s
+                                return "(vec_uint4){ [3] = %s }" % val_s if idx == 3 else "spu_insert(%s, (vec_uint4){0}, %d)" % (val_s, idx)
+                            return "spu_insert(%s, %s, %d)" % (val_s, old_s, idx)
+                        elif c_insn.ew == EW.H:
+                            idx = slot // 2
+                            if old_s == "0" and idx == 0:
+                                return val_s
+                            return "spu_insert(%s, %s, %d)" % (val_s, old_s, idx)
+                        else:
+                            if old_s == "0" and slot == 0:
+                                return val_s
+                            return "spu_insert(%s, %s, %d)" % (val_s, old_s, slot)
                     c_addr = self.operand(c_insn.srcs[0], depth, True, want_scalar=True)
                     if c_insn.ew == EW.W:
-                        return "vec_insert_w(%s, %s, (%s & 0xF) / 4)" % (val_s, old_s, c_addr)
+                        return "spu_insert(%s, %s, (%s & 0xF) / 4)" % (val_s, old_s, c_addr)
                     elif c_insn.ew == EW.H:
-                        return "vec_insert_h(%s, %s, (%s & 0xF) / 2)" % (val_s, old_s, c_addr)
+                        return "spu_insert(%s, %s, (%s & 0xF) / 2)" % (val_s, old_s, c_addr)
                     else:
-                        return "vec_insert_b(%s, %s, %s & 0xF)" % (val_s, old_s, c_addr)
+                        return "spu_insert(%s, %s, %s & 0xF)" % (val_s, old_s, c_addr)
             a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
             b_str = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
             m_str = self.operand(insn.srcs[2], depth, False)
-            return "__builtin_shuffle(%s, %s, %s)" % (a_str, b_str, m_str)
+            return "spu_shuffle(%s, %s, %s)" % (a_str, b_str, m_str)
 
         if op == Op.CLZ and len(insn.srcs) >= 1:
             arg = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
@@ -1215,7 +1402,7 @@ class CGen(object):
         than giving up.  So the count is recorded and stated in the header
         instead.
         """
-        from .scalarize import addr_expr
+        from .scalarize import addr_expr, word0
 
         sp_in = (regs.SP, 0)
         # Values built from the incoming stack pointer, so an address that
@@ -1269,7 +1456,7 @@ class CGen(object):
                     base, off, _ = addr_expr(d, self.defs)
                     if base == sp_in:
                         signed_off = frame.signed_offset(off)
-                        if signed_off != 0 and (self.frame.size is None or -self.frame.size <= signed_off <= 0x40):
+                        if signed_off != 0 and -0x4000 <= signed_off <= 0x200:
                             g = groups.setdefault((base, off), {"ew": EW.Q, "types": {}, "name": None})
                             if g["ew"] is None:
                                 g["ew"] = EW.Q
@@ -1316,7 +1503,7 @@ class CGen(object):
             self._slots = self._slot_types()
         if not self._slots:
             return None
-        from .scalarize import addr_expr
+        from .scalarize import addr_expr, word0
         d = insn.defines()
         if d is None:
             return None
@@ -1346,7 +1533,7 @@ class CGen(object):
             self._slots = self._slot_types()
         if not self._slots or len(insn.srcs) < 2:
             return None
-        from .scalarize import addr_expr
+        from .scalarize import addr_expr, word0
         base, off, _ = addr_expr(insn.srcs[1], self.defs)
         slot_base = off & ~0xF
         byte_off = off & 0xF
@@ -1581,6 +1768,86 @@ class CGen(object):
         """
         return regs.ARG_FIRST if self.member_class else None
 
+    def _find_sbox_trees(self):
+        """
+        Identify 7-SELB + 8-SHUFB binary trees implementing SPU AES S-box lookup.
+        Returns:
+            trees: dict of root_key -> (input_var, is_inv, tree_insns, mask_insn)
+            debris_keys: set of SSA keys for all internal tree instructions to suppress
+        """
+        defs = self.defs
+        trees = {}
+        debris_keys = set()
+        for insn in self.func.insns():
+            if insn.op != Op.SELB or len(insn.srcs) < 3:
+                continue
+            # Level 2 (2 SELBs)
+            l2 = []
+            ok = True
+            for s in insn.srcs[:2]:
+                if not s.is_var or s.key() not in defs or defs[s.key()].op != Op.SELB:
+                    ok = False
+                    break
+                l2.append(defs[s.key()])
+            if not ok or len(l2) != 2:
+                continue
+            # Level 1 (4 SELBs)
+            l1 = []
+            for n in l2:
+                for s in n.srcs[:2]:
+                    if not s.is_var or s.key() not in defs or defs[s.key()].op != Op.SELB:
+                        ok = False
+                        break
+                    l1.append(defs[s.key()])
+                if not ok:
+                    break
+            if not ok or len(l1) != 4:
+                continue
+            # Level 0 (8 SHUFBs)
+            shufs = []
+            for n in l1:
+                for s in n.srcs[:2]:
+                    if not s.is_var or s.key() not in defs or defs[s.key()].op != Op.SHUFB:
+                        ok = False
+                        break
+                    shufs.append(defs[s.key()])
+                if not ok:
+                    break
+            if not ok or len(shufs) != 8:
+                continue
+
+            masks = [s.srcs[2] for s in shufs]
+            mask_keys = set(m.key() for m in masks if m.is_var)
+            if len(mask_keys) != 1:
+                continue
+            mask_insn = defs.get(list(mask_keys)[0])
+            if mask_insn is None or mask_insn.op != Op.AND or len(mask_insn.srcs) < 2:
+                continue
+            inp_var = mask_insn.srcs[0]
+
+            # Detect inverse S-box: check if sources trace to 0xCB30..0xCC20
+            is_inv = False
+            for s in shufs:
+                for src in s.srcs[:2]:
+                    if src.is_var and src.key() in defs:
+                        sd = defs[src.key()]
+                        if sd.op in (Op.LOAD, Op.LOADQ) and len(sd.srcs) >= 2:
+                            ca = _get_const_addr(sd.srcs[1], defs)
+                            if ca is not None and 0xCB30 <= ca <= 0xCC20:
+                                is_inv = True
+
+            tree_insns = [insn] + l2 + l1 + shufs
+            trees[insn.dst.key()] = (inp_var, is_inv, tree_insns, mask_insn)
+            for node in tree_insns[1:]:
+                d = node.defines()
+                if d is not None:
+                    debris_keys.add(d.key())
+            d_mask = mask_insn.defines()
+            if d_mask is not None:
+                debris_keys.add(d_mask.key())
+
+        return trees, debris_keys
+
     def _compute_debris(self):
         """
         Dead remnants of a store idiom that a call's operand list pinned.
@@ -1607,7 +1874,8 @@ class CGen(object):
         operands, so a value some indeterminate callee might take is never
         removed even if it did feed the idiom.
         """
-        roots = getattr(self.func, "store_idiom_roots", None) or set()
+        self.sbox_trees, sbox_debris = self._find_sbox_trees()
+        roots = (getattr(self.func, "store_idiom_roots", None) or set()) | sbox_debris
         defs = self.defs
 
         # 1. Arity-aware liveness: what a real reader (or a call that really
@@ -1618,6 +1886,10 @@ class CGen(object):
 
         def keeping(insn):
             op = insn.op
+            d = insn.defines()
+            if d is not None and hasattr(self, 'sbox_trees') and d.key() in self.sbox_trees:
+                inp_var = self.sbox_trees[d.key()][0]
+                return [inp_var] if inp_var.is_var else []
             if op in ABI_OPS:
                 keep = list(insn.srcs[:ABI_OPS[op]])      # indirect target
                 if op in (Op.CALL, Op.TCALL):
@@ -1670,7 +1942,10 @@ class CGen(object):
         # dead `r5 = #0x2e698:w4` the call's operand list still pins.  A dead
         # constant or unused stack address computation read by nothing real
         # carries no information wherever it sits, so drop those too.
-        cone |= {k for k in dead if defs[k].op in (Op.CONST, Op.ADD, Op.MOV)}
+        cone |= {k for k in dead if defs[k].op in (Op.CONST, Op.ADD, Op.MOV) or
+                 (defs[k].op in (Op.LOAD, Op.LOADQ) and len(defs[k].srcs) >= 2
+                  and _get_const_addr(defs[k].srcs[1], defs) is not None)}
+        cone |= sbox_debris
 
         # 3. Arithmetic carry/borrow idioms feeding ADDX/SUBX.
         uses_of = {}

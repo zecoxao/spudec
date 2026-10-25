@@ -340,8 +340,52 @@ class _Ctx(object):
 
     def if_follow(self, b, stop):
         f = self.ipdom.get(b)
-        if f is None:
-            return stop              # one arm leaves the function
+        taken, fall = self.cjmp_targets(b)
+        if taken is None or fall is None:
+            return f if f is not None else stop
+
+        def reaches_without(src, dst, avoid, visited=None):
+            if src is dst:
+                return True
+            if src is avoid or (stop is not None and src.id == stop.id):
+                return False
+            if visited is None:
+                visited = set()
+            if src.id in visited:
+                return False
+            visited.add(src.id)
+            return any(reaches_without(s, dst, avoid, visited) for s in src.succs)
+
+        def is_early_exit(node, target):
+            visited = set()
+            stack = [node]
+            while stack:
+                curr = stack.pop()
+                if curr is target:
+                    return False
+                if curr.id in visited:
+                    continue
+                visited.add(curr.id)
+                if curr.insns and curr.insns[-1].op in (Op.RET, Op.STOP):
+                    continue
+                if not curr.succs:
+                    continue
+                for s in curr.succs:
+                    if s not in visited:
+                        stack.append(s)
+            return True
+
+        if reaches_without(taken, fall, b) and not reaches_without(fall, taken, b):
+            return fall
+        if reaches_without(fall, taken, b) and not reaches_without(taken, fall, b):
+            return taken
+        if is_early_exit(taken, fall):
+            return fall
+        if is_early_exit(fall, taken):
+            return taken
+
+        if f is None or (stop is not None and f.id == stop.id):
+            return stop
         return f
 
 
