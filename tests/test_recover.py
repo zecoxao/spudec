@@ -61,6 +61,20 @@ def test_db_persistence():
     db.set_func_proto(ea, None)
     assert db.get_func_data(ea)["proto"] is None
 
+    # Window state persistence
+    db.save_window_state(True, ea, lineno=14, col=5, mode="c")
+    state = db.load_window_state()
+    assert state["is_open"] is True
+    assert state["func_ea"] == ea
+    assert state["lineno"] == 14
+    assert state["col"] == 5
+    assert state["mode"] == "c"
+
+    db.save_window_state(False, ea)
+    state2 = db.load_window_state()
+    assert state2["is_open"] is False
+    assert state2["func_ea"] == ea
+
     db.clear_all()
     print("ok  test_db_persistence")
 
@@ -768,6 +782,148 @@ def test_aes_and_sha_shuffle_elimination_to_native_c():
     print("ok  test_aes_and_sha_shuffle_elimination_to_native_c")
 
 
+def test_hexrays_parity_features():
+    """Verify Hex-Rays parity: compound locators, statement comments, and iflag inversion."""
+    import spudec
+    from spudec import db, cgen, structure, ssa, opt
+
+    fn_ea = 0x8000
+    db.clear_all()
+
+    # 1. Test compound locators in db
+    loc_key = "reg:3@0x8004"
+    db.set_var_locator(fn_ea, loc_key, name="packet_counter", type_str="uint32_t", flags=1)
+    retrieved = db.get_var_locator(fn_ea, loc_key)
+    assert retrieved is not None
+    assert retrieved["name"] == "packet_counter"
+    assert retrieved["type"] == "uint32_t"
+    assert retrieved["flags"] == 1
+
+    # 2. Test statement comment in db
+    stmt_ea = 0x8008
+    db.set_statement_cmt(fn_ea, stmt_ea, "Check packet size bounds")
+    assert db.get_statement_cmt(fn_ea, stmt_ea) == "Check packet size bounds"
+
+    # 3. Test iflag toggle in db
+    assert not db.is_iflag_inverted(fn_ea, 0x8010)
+    db.toggle_iflag(fn_ea, 0x8010)
+    assert db.is_iflag_inverted(fn_ea, 0x8010)
+    db.toggle_iflag(fn_ea, 0x8010)
+    assert not db.is_iflag_inverted(fn_ea, 0x8010)
+    db.toggle_iflag(fn_ea, 0x8010)
+
+    # 4. Test number format in db
+    db.set_numform(fn_ea, 0x8004, 0, "hex")
+    assert db.get_numform(fn_ea, 0x8004, 0) == "hex"
+
+    # 5. Build function with an if-else statement and verify comment + inversion in cgen
+    f = Function(fn_ea, "process_packet")
+    b0 = f.new_block(0x8000, 0x8010)
+    b_then = f.new_block(0x8014, 0x8020)
+    b_else = f.new_block(0x8024, 0x8030)
+    b_exit = f.new_block(0x8034, 0x8040)
+
+    b0.succs.extend([b_then, b_else])
+    b_then.preds.append(b0)
+    b_else.preds.append(b0)
+    b_then.succs.append(b_exit)
+    b_else.succs.append(b_exit)
+    b_exit.preds.extend([b_then, b_else])
+
+    # b0: r3 holds a1, compare r3 == 0
+    b0.add(Insn(Op.MOV, Var(3), [Var(3)], EW.W, ea=0x8000))
+    b0.add(Insn(Op.CONST, Var(4), [Const(0)], EW.W, ea=0x8004))
+    b0.add(Insn(Op.CMPEQ, Var(5), [Var(3), Var(4)], EW.W, ea=0x8008))
+    b0.add(Insn(Op.CJMP, None, [Var(5)], aux=(0x8014, "nz"), ea=0x8010))
+
+    # b_then: r3 = 1
+    b_then.add(Insn(Op.CONST, Var(3), [Const(1 << 96)], EW.W, ea=0x8014))
+    b_then.add(Insn(Op.JMP, None, [], ea=0x801C, aux=0x8034))
+
+    # b_else: r3 = 2
+    b_else.add(Insn(Op.CONST, Var(3), [Const(2 << 96)], EW.W, ea=0x8024))
+    b_else.add(Insn(Op.JMP, None, [], ea=0x802C, aux=0x8034))
+
+    # b_exit: ret
+    b_exit.add(Insn(Op.RET, None, [Var(regs.R_MEM), Var(3)], ea=0x8034))
+
+    ssa.to_ssa(f)
+    opt.optimize(f)
+
+    # Generate pseudocode: db overrides should automatically apply!
+    lines = spudec.pseudocode(f)
+    code = "\n".join(lines)
+
+    # Verify statement comment was emitted
+    assert "// Check packet size bounds" in code, f"Comment not found in:\n{code}"
+
+    # Verify condition inversion: with 0x8010 inverted, the if is present
+    assert "if (" in code, f"Missing if in:\n{code}"
+
+    print("ok  test_hexrays_parity_features")
+
+
+def test_byte_and_halfword_constant_formatting():
+    def repl(val, ew):
+        bits = int(ew) * 8
+        val &= (1 << bits) - 1
+        out = 0
+        for _ in range(16 // int(ew)):
+            out = (out << bits) | val
+        return out
+
+    # Verify that byte compares and constants are not expanded to 32-bit values (e.g. 0x7F -> 0x7F7F7F7F)
+    f = Function(0x9000, "test_byte_checks")
+    b0 = f.new_block(0x9000, 0x9040)
+    b_exit = f.new_block(0x9040, 0x9050)
+
+    # cmpeq.b r5, r3, 0x7F
+    c_7f = Const(repl(0x7F, EW.B), ew=EW.B)
+    b0.add(Insn(Op.CMPEQ, Var(5), [Var(3), c_7f], EW.B, ea=0x9000))
+
+    # cmpeq.b r6, r4, 0x45 ('E')
+    c_45 = Const(repl(0x45, EW.B), ew=EW.B)
+    b0.add(Insn(Op.CMPEQ, Var(6), [Var(4), c_45], EW.B, ea=0x9004))
+
+    # add.h r8, r7, -2 (0xFFFE)
+    c_neg2 = Const(repl(0xFFFE, EW.H), ew=EW.H)
+    b0.add(Insn(Op.ADD, Var(8), [Var(7), c_neg2], EW.H, ea=0x9008))
+
+    # cmpgtu.h r10, r8, 1
+    c_1 = Const(repl(1, EW.H), ew=EW.H)
+    b0.add(Insn(Op.CMPGTU, Var(10), [Var(8), c_1], EW.H, ea=0x900C))
+
+    # Combine into r3 (SPU return register) so DCE preserves all operations
+    b0.add(Insn(Op.OR, Var(11), [Var(5), Var(6)], EW.W, ea=0x9010))
+    b0.add(Insn(Op.OR, Var(12), [Var(11), Var(8)], EW.W, ea=0x9014))
+    b0.add(Insn(Op.OR, Var(3), [Var(12), Var(10)], EW.W, ea=0x9018))
+
+    b0.succs = [b_exit]
+    b_exit.preds = [b0]
+    b_exit.add(Insn(Op.RET, None, [Var(regs.R_MEM), Var(3)], ea=0x9040))
+
+    ssa.to_ssa(f)
+    opt.optimize(f)
+    outssa.lower_phis(f)
+    stmts, info = structure.structure(f)
+    lines = cgen.generate(f, stmts, info)
+    code = "\n".join(lines)
+
+    # Verify byte values are not expanded to 32-bit word replicas
+    assert "0x7F7F7F7F" not in code, f"Found expanded 0x7F7F7F7F in:\n{code}"
+    assert "0x45454545" not in code, f"Found expanded 0x45454545 in:\n{code}"
+    assert "0xFFFEFFFE" not in code, f"Found expanded 0xFFFEFFFE in:\n{code}"
+    assert "0x10001" not in code, f"Found expanded 0x10001 in:\n{code}"
+
+    # Verify native byte and halfword representation
+    assert "0x7F" in code, f"Missing 0x7F in:\n{code}"
+    assert "0x45" in code, f"Missing 0x45 in:\n{code}"
+    assert "0x2" in code, f"Missing 0x2 in:\n{code}"
+    assert "0x1" in code, f"Missing 0x1 in:\n{code}"
+
+    print("ok  test_byte_and_halfword_constant_formatting")
+
+
 if __name__ == "__main__":
     test_db_persistence()
     test_proto_parser()
@@ -785,4 +941,6 @@ if __name__ == "__main__":
     test_tail_call_argument_preservation()
     test_tier2_3_improvements()
     test_aes_and_sha_shuffle_elimination_to_native_c()
+    test_hexrays_parity_features()
+    test_byte_and_halfword_constant_formatting()
     print("\nall recover tests passed")

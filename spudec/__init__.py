@@ -464,6 +464,10 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
 
     # Load persistent overrides from IDB netnode when not explicitly supplied
     fn_ea = getattr(func, "start_ea", None)
+    user_cmts = None
+    user_iflags = None
+    user_numforms = None
+    user_lvars = None
     if fn_ea is not None:
         db_data = db.get_func_data(fn_ea)
         if user_renames is None:
@@ -472,6 +476,10 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
             user_types = dict(db_data.get("types", {}))
         if user_proto is None:
             user_proto = db_data.get("proto")
+        user_cmts = db_data.get("cmts", {})
+        user_iflags = db_data.get("iflags", [])
+        user_numforms = db_data.get("numforms", {})
+        user_lvars = db_data.get("lvars", {})
 
         # If prototype override is not set in netnode, check if IDA has a prototype
         if user_proto is None:
@@ -503,4 +511,6 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
                          str_of=str_of, stk_of=stk_of, this_of=this_of,
                          sym_of=sym_of,
                          user_renames=user_renames, user_types=user_types,
-                         user_proto=user_proto)
+                         user_proto=user_proto,
+                         user_cmts=user_cmts, user_iflags=user_iflags,
+                         user_numforms=user_numforms, user_lvars=user_lvars)

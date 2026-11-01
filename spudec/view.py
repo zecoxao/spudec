@@ -144,6 +144,9 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self._highlighted_asm_eas = set()
         self._sync_lock = False
         self.sync_with_disasm = db.get_sync_enabled()
+        self._nav_history = []
+        self._last_token = None
+        self._highlighted_token_lines = set()
 
     def build_or_refresh(self, target, mode=None, preserve_cursor=False):
         """Populate or update lines with decompiled Function or EA."""
@@ -306,6 +309,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
 
     def clear_asm_highlights(self):
         """Restore default background color for all previously highlighted asm instructions."""
+        self._last_token = None
+        self._highlighted_token_lines.clear()
         if not self._highlighted_asm_eas:
             return
         import ida_nalt
@@ -440,6 +445,49 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         closest_ea = min(self.ea_to_line.keys(), key=lambda e: abs(e - ea))
         return self.ea_to_line[closest_ea]
 
+    def _update_token_highlight(self):
+        """Highlight all occurrences of the identifier under caret across the view."""
+        if self.mode != "c" or not self.raw_lines:
+            return
+        word, lineno, col = self.get_word_under_cursor()
+        active_token = None
+        if word and (word[0].isalpha() or word[0] == "_"):
+            if word not in highlight.C_KEYWORDS and word not in highlight.C_TYPES:
+                active_token = word
+
+        if active_token == self._last_token:
+            return
+
+        self._last_token = active_token
+        _, decomp_bg = _get_highlight_colors()
+
+        to_restore = set(self._highlighted_token_lines)
+        self._highlighted_token_lines.clear()
+
+        new_matching = set()
+        if active_token:
+            pat = re.compile(r"\b" + re.escape(active_token) + r"\b")
+            for idx, raw in enumerate(self.raw_lines):
+                if idx >= self.header_count and pat.search(raw):
+                    new_matching.add(idx)
+
+        affected = to_restore.union(new_matching)
+        for idx in affected:
+            if 0 <= idx < len(self.raw_lines):
+                try:
+                    colored = highlight.colorize(self.raw_lines[idx], highlight_ident=active_token)
+                    bg = decomp_bg if idx == self._selected_line else 0xFFFFFFFF
+                    self.EditLine(idx, colored, bgcolor=bg)
+                    if idx in new_matching:
+                        self._highlighted_token_lines.add(idx)
+                except Exception:
+                    pass
+        if affected:
+            try:
+                self.RefreshCurrent()
+            except Exception:
+                pass
+
     def on_cursor_changed(self):
         """Called when user clicks or navigates in decompiler window."""
         if self._sync_lock:
@@ -450,12 +498,14 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         lineno = pos[0]
         if lineno < 0 or lineno >= len(self.raw_lines):
             return
-        if lineno == self._selected_line:
-            return
 
         self._sync_lock = True
         try:
-            self.select_line(lineno, jump=False, update_asm=True, jump_asm=True)
+            if lineno != self._selected_line:
+                self.select_line(lineno, jump=False, update_asm=True, jump_asm=True)
+            self._update_token_highlight()
+            if self.current_func_ea is not None:
+                db.save_window_state(True, self.current_func_ea, lineno=lineno, col=pos[1], mode=self.mode)
         finally:
             self._sync_lock = False
 
@@ -467,6 +517,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
 
     def Close(self):
         self.clear_asm_highlights()
+        if self.current_func_ea is not None:
+            db.save_window_state(False, self.current_func_ea, mode=self.mode)
         return super().Close()
 
     def show_func(self, ea, preserve_cursor=False):
@@ -824,6 +876,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
                     if pfn and pfn.start_ea == target_ea:
                         _jumpto_disasm(target_ea)
                         if target_ea != self.current_func_ea:
+                            pos = self.GetPos()
+                            self._nav_history.append((self.current_func_ea, pos[0] if pos else 0, pos[1] if pos else 0))
                             self.show_func(target_ea)
                         return True
                     else:
@@ -840,6 +894,8 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
                     pfn = ida_funcs.get_func(target_ea)
                     _jumpto_disasm(target_ea)
                     if pfn and pfn.start_ea == target_ea and target_ea != self.current_func_ea:
+                        pos = self.GetPos()
+                        self._nav_history.append((self.current_func_ea, pos[0] if pos else 0, pos[1] if pos else 0))
                         self.show_func(target_ea)
                     return True
                 except ValueError:
@@ -873,6 +929,46 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             return True
         return False
 
+    def on_invert_if(self):
+        """Invert if-condition and swap then/else branches (Hex-Rays 'I' hotkey)."""
+        pos = self.GetPos()
+        if not pos or pos[0] >= len(self.raw_lines):
+            return
+        lineno = pos[0]
+        ea = self.line_ea[lineno] if lineno < len(self.line_ea) else None
+        if ea is None and lineno in self.line_to_eas and self.line_to_eas[lineno]:
+            ea = self.line_to_eas[lineno][0]
+        if ea is not None:
+            db.toggle_iflag(self.current_func_ea, ea)
+            self.show_func(self.current_func_ea, preserve_cursor=True)
+
+    def on_edit_comment(self):
+        """Add or edit statement comment attached to linear address (Hex-Rays '/' hotkey)."""
+        pos = self.GetPos()
+        if not pos or pos[0] >= len(self.raw_lines):
+            return
+        lineno = pos[0]
+        ea = self.line_ea[lineno] if lineno < len(self.line_ea) else None
+        if ea is None and lineno in self.line_to_eas and self.line_to_eas[lineno]:
+            ea = self.line_to_eas[lineno][0]
+        if ea is not None:
+            existing = db.get_statement_cmt(self.current_func_ea, ea) or ""
+            new_cmt = ida_kernwin.ask_str(existing, 0, f"Comment for statement at 0x{ea:X}")
+            if new_cmt is not None:
+                db.set_statement_cmt(self.current_func_ea, ea, new_cmt)
+                self.show_func(self.current_func_ea, preserve_cursor=True)
+
+    def on_set_numform(self, form_str):
+        """Set immediate number format ('hex', 'dec', 'char')."""
+        pos = self.GetPos()
+        if not pos or pos[0] >= len(self.raw_lines):
+            return
+        lineno = pos[0]
+        ea = self.line_ea[lineno] if lineno < len(self.line_ea) else None
+        if ea is not None:
+            db.set_numform(self.current_func_ea, ea, 0, form_str)
+            self.show_func(self.current_func_ea, preserve_cursor=True)
+
     def OnDblClick(self, shift):
         return self.jump_disasm()
 
@@ -884,7 +980,22 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             self.on_set_type()
             return True
         if vkey in (ord('I'), ord('i')):
-            self.toggle_ir()
+            if shift & 1:
+                self.toggle_ir()
+            else:
+                self.on_invert_if()
+            return True
+        if vkey == ord('/'):
+            self.on_edit_comment()
+            return True
+        if vkey in (ord('H'), ord('h')):
+            self.on_set_numform('hex')
+            return True
+        if vkey in (ord('D'), ord('d')):
+            self.on_set_numform('dec')
+            return True
+        if vkey in (ord('R'), ord('r')):
+            self.on_set_numform('char')
             return True
         if vkey == 116:  # F5
             if self.current_func_ea is not None:
@@ -896,6 +1007,15 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             self.toggle_sync()
             return True
         if vkey == 27:  # Esc
+            if self._nav_history:
+                prev_ea, prev_line, prev_col = self._nav_history.pop()
+                self.show_func(prev_ea)
+                try:
+                    self.select_line(prev_line, jump=True, update_asm=True, jump_asm=True)
+                    self.Jump(prev_line, prev_col)
+                except Exception:
+                    pass
+                return True
             global _active_viewer
             self.clear_asm_highlights()
             _active_viewer = None
@@ -915,6 +1035,45 @@ class _UiHooks(ida_kernwin.UI_Hooks):
         super().__init__()
         self.view = view
 
+    def create_desktop_widget(self, title, cfg):
+        if title == _VIEW_TITLE:
+            global _active_viewer, _view_hooks
+            if _active_viewer is None or _active_viewer.GetWidget() is None:
+                v = _DecompilerView()
+                if v.Create(_VIEW_TITLE):
+                    _active_viewer = v
+                    _register_actions(_active_viewer)
+                    self.view = _active_viewer
+                    if _view_hooks is None:
+                        _view_hooks = _CustViewHooks(_active_viewer)
+                        _view_hooks.hook()
+                    else:
+                        _view_hooks.view = _active_viewer
+                    return _active_viewer.GetWidget()
+            else:
+                return _active_viewer.GetWidget()
+        return None
+
+    def desktop_applied(self, name, from_idb, type):
+        self._restore_from_state()
+
+    def database_inited(self, is_new_database):
+        self._restore_from_state()
+
+    def saving(self):
+        self._record_current_state()
+
+    def saved(self):
+        self._record_current_state()
+
+    def _record_current_state(self):
+        global _active_viewer
+        if _active_viewer is not None and _active_viewer.GetWidget() is not None:
+            pos = _active_viewer.GetPos() or (0, 0)
+            if _active_viewer.current_func_ea is not None:
+                db.save_window_state(True, _active_viewer.current_func_ea,
+                                     lineno=pos[0], col=pos[1], mode=_active_viewer.mode)
+
     def screen_ea_changed(self, ea, prev_ea):
         """Automatically follow current function in disassembly and sync line selection."""
         if not self.view or self.view._sync_lock:
@@ -932,10 +1091,12 @@ class _UiHooks(ida_kernwin.UI_Hooks):
         self.view.sync_from_disasm_ea(ea)
 
     def widget_invisible(self, widget):
-        """Reset active viewer when the decompiler window is closed."""
+        """Reset active viewer and persist closed state when the decompiler window is closed."""
         if self.view and widget == self.view.GetWidget():
             global _active_viewer
             self.view.clear_asm_highlights()
+            if self.view.current_func_ea is not None:
+                db.save_window_state(False, self.view.current_func_ea, mode=self.view.mode)
             _active_viewer = None
 
     def finish_populating_widget_popup(self, widget, popup_handle):
@@ -952,6 +1113,31 @@ class _UiHooks(ida_kernwin.UI_Hooks):
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_JUMP_DISASM)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_REFRESH)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_TOGGLE_IR)
+
+    def _restore_from_state(self):
+        global _active_viewer
+        state = db.load_window_state()
+        if not state.get("is_open") or not state.get("func_ea"):
+            return
+        func_ea = state["func_ea"]
+        mode = state.get("mode", "c")
+        lineno = state.get("lineno", 0)
+        col = state.get("col", 0)
+        if _active_viewer is not None and _active_viewer.GetWidget() is not None:
+            if _active_viewer.current_func_ea != func_ea or not _active_viewer.raw_lines:
+                _active_viewer.show_func(func_ea)
+            if lineno:
+                try:
+                    _active_viewer.Jump(lineno, col)
+                except Exception:
+                    pass
+        else:
+            show(func_ea, mode=mode, auto_dock=False)
+            if _active_viewer is not None and lineno:
+                try:
+                    _active_viewer.Jump(lineno, col)
+                except Exception:
+                    pass
 
 
 class _CustViewHooks(ida_kernwin.View_Hooks):
@@ -997,15 +1183,17 @@ def _register_actions(view):
         ida_kernwin.register_action(desc)
 
 
-def show(target, mode="c"):
+def show(target, mode="c", auto_dock=True):
     """Open or refresh the dockable decompiler view for the specified function or EA."""
     global _active_viewer, _ui_hooks, _view_hooks
+    first_create = False
     if _active_viewer is None or _active_viewer.GetWidget() is None:
         v = _DecompilerView()
         if not v.Create(_VIEW_TITLE):
             return None
         _active_viewer = v
         _register_actions(_active_viewer)
+        first_create = True
 
         if _ui_hooks is None:
             _ui_hooks = _UiHooks(_active_viewer)
@@ -1021,7 +1209,26 @@ def show(target, mode="c"):
 
     _active_viewer.build_or_refresh(target, mode=mode)
     _active_viewer.Show()
+
+    if first_create and auto_dock:
+        try:
+            ida_kernwin.set_dock_pos(_VIEW_TITLE, "IDA View-A", ida_kernwin.DP_RIGHT)
+        except Exception:
+            pass
+
+    if _active_viewer.current_func_ea is not None:
+        pos = _active_viewer.GetPos() or (0, 0)
+        db.save_window_state(True, _active_viewer.current_func_ea, lineno=pos[0], col=pos[1], mode=_active_viewer.mode)
+
     return _active_viewer
+
+
+def init_hooks():
+    """Initialize UI hooks early (at plugin load) to support desktop/docking persistence."""
+    global _ui_hooks
+    if _ui_hooks is None:
+        _ui_hooks = _UiHooks(None)
+        _ui_hooks.hook()
 
 
 class ListingViewer(ida_kernwin.simplecustviewer_t):

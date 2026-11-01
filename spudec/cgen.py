@@ -365,7 +365,8 @@ class CGen(object):
 
     def __init__(self, func, name_of=None, arity_of=None, str_of=None,
                  stk_of=None, this_of=None, sym_of=None,
-                 user_renames=None, user_types=None, user_proto=None):
+                 user_renames=None, user_types=None, user_proto=None,
+                 user_cmts=None, user_iflags=None, user_numforms=None, user_lvars=None):
         self.func = func
         self.arity_of = arity_of
         self.str_of = str_of or (lambda ea: None)
@@ -373,6 +374,25 @@ class CGen(object):
         self.user_renames = dict(user_renames or {})
         self.user_types = dict(user_types or {})
         self.user_proto = user_proto
+        self.user_cmts = dict(user_cmts or {})
+        self.user_iflags = set(user_iflags or ())
+        self.user_numforms = dict(user_numforms or {})
+        self.user_lvars = dict(user_lvars or {})
+
+        if self.user_lvars:
+            for loc_key, lvar_info in self.user_lvars.items():
+                if isinstance(lvar_info, dict):
+                    nm = lvar_info.get("name")
+                    ty = lvar_info.get("type")
+                    base_name = loc_key.split("@")[0] if "@" in loc_key else loc_key
+                    if ":" in base_name:
+                        base_name = base_name.split(":", 1)[1]
+                    if nm:
+                        self.user_renames.setdefault(base_name, nm)
+                        if ty:
+                            self.user_types.setdefault(nm, ty)
+                    elif ty:
+                        self.user_types.setdefault(base_name, ty)
 
         self.body_eas = []
         self.body_line_to_eas = {}
@@ -597,7 +617,7 @@ class CGen(object):
         return self.user_renames.get(name, name)
 
 
-    def const(self, c, scalar, strings=True):
+    def const(self, c, scalar, strings=True, ew=None):
         """
         A constant, as a string literal when its preferred slot points at one.
 
@@ -620,7 +640,22 @@ class CGen(object):
             return "&" + eff_sym
         if c.val == 0:
             return "0"
-        for cand in (EW.W, EW.H, EW.B, EW.D):
+
+        eff_ew = ew or getattr(c, "ew", None)
+        if c.val == (1 << 128) - 1:
+            if eff_ew == EW.B:
+                return "0xFF"
+            elif eff_ew in (EW.H, EW.W, EW.D):
+                return "-0x1"
+            else:
+                return "-0x1"
+
+        cands = [eff_ew] if eff_ew is not None and eff_ew != EW.Q else []
+        for cand in (EW.B, EW.H, EW.W, EW.D):
+            if cand not in cands:
+                cands.append(cand)
+
+        for cand in cands:
             bits = int(cand) * 8
             n = 16 // int(cand)
             lane = c.val >> (128 - bits)
@@ -634,7 +669,11 @@ class CGen(object):
                     if lane >= 0x8000000000000000 and (0x10000000000000000 - lane) <= 0xFFFF:
                         return "-0x%X" % (0x10000000000000000 - lane)
                     return "0x%X" % lane
-                else:
+                elif cand == EW.H:
+                    if lane >= 0x8000 and (0x10000 - lane) <= 0xFF:
+                        return "-0x%X" % (0x10000 - lane)
+                    return "0x%X" % lane
+                else:  # EW.B
                     return "0x%X" % lane
         if scalar:
             return c.scalar_str()
@@ -643,7 +682,7 @@ class CGen(object):
         return "0x%032X" % c.val
 
     def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False,
-                strings=True):
+                strings=True, ew=None):
         """
         ``top`` means the result already sits in a context that brackets it --
         the inside of a `*(u32 *)(...)`, or the whole right-hand side of an
@@ -655,7 +694,7 @@ class CGen(object):
         addresses are both like that.
         """
         if v.is_const:
-            return self.const(v, scalar, strings)
+            return self.const(v, scalar, strings, ew=ew or getattr(v, "ew", None))
         if depth < MAX_INLINE_DEPTH and v.key() in self.inlinable:
             def_insn = self.defs[v.key()]
             if getattr(def_insn, "ea", None) is not None:
@@ -824,6 +863,14 @@ class CGen(object):
                           self.operand(insn.srcs[1], depth, wide))
             return text if (top or wrapped) else "(%s)" % text
         if op == Op.NOT and len(insn.srcs) == 1:
+            arg_op = insn.srcs[0]
+            if arg_op.is_var and arg_op.key() in self.defs:
+                d = self.defs[arg_op.key()]
+                if d.op in (Op.CMPEQ, Op.FCMPEQ) and len(d.srcs) == 2:
+                    lhs = self.operand(d.srcs[0], depth, True, want_scalar=True, ew=d.ew)
+                    rhs = self.operand(d.srcs[1], depth, True, want_scalar=True, ew=d.ew)
+                    text = "%s != %s" % (lhs, rhs)
+                    return text if top else "(%s)" % text
             return "~%s" % self.operand(insn.srcs[0], depth,
                                         self._scalarish(insn))
 
@@ -863,8 +910,23 @@ class CGen(object):
                 sc = True
 
         if sc and op in INFIX and len(insn.srcs) == 2:
-            lhs = self.operand(insn.srcs[0], depth, True)
-            rhs = self.operand(insn.srcs[1], depth, True)
+            if op == Op.CMPEQ and insn.srcs[1].is_const and (insn.srcs[1].val >> 96) == 0:
+                cur = insn.srcs[0]
+                while cur.is_var and cur.key() in self.defs:
+                    d = self.defs[cur.key()]
+                    if d.op == Op.EXTS and len(d.srcs) == 1:
+                        cur = d.srcs[0]
+                    else:
+                        break
+                if cur.is_var and cur.key() in self.defs:
+                    cmp_d = self.defs[cur.key()]
+                    if cmp_d.op in (Op.CMPEQ, Op.FCMPEQ) and len(cmp_d.srcs) == 2:
+                        lhs = self.operand(cmp_d.srcs[0], depth, True, want_scalar=True, ew=cmp_d.ew)
+                        rhs = self.operand(cmp_d.srcs[1], depth, True, want_scalar=True, ew=cmp_d.ew)
+                        text = "%s != %s" % (lhs, rhs)
+                        return text if top else "(%s)" % text
+            lhs = self.operand(insn.srcs[0], depth, True, ew=insn.ew)
+            rhs = self.operand(insn.srcs[1], depth, True, ew=insn.ew)
             if op in (Op.ADD, Op.SUB):
                 lhs = self._byte_ptr(insn.srcs[0], lhs)
                 rhs = self._byte_ptr(insn.srcs[1], rhs)
@@ -877,8 +939,8 @@ class CGen(object):
             return text if top else "(%s)" % text
 
         if op in (Op.ADDX, Op.SUBX) and len(insn.srcs) >= 2:
-            lhs = self.operand(insn.srcs[0], depth, True)
-            rhs = self.operand(insn.srcs[1], depth, True)
+            lhs = self.operand(insn.srcs[0], depth, True, ew=insn.ew)
+            rhs = self.operand(insn.srcs[1], depth, True, ew=insn.ew)
             lhs = self._byte_ptr(insn.srcs[0], lhs)
             rhs = self._byte_ptr(insn.srcs[1], rhs)
             sym = "+" if op == Op.ADDX else "-"
@@ -888,6 +950,18 @@ class CGen(object):
             return text if top else "(%s)" % text
 
         if op == Op.EXTS and len(insn.srcs) == 1:
+            arg_op = insn.srcs[0]
+            if arg_op.is_var and arg_op.key() in self.defs:
+                d = self.defs[arg_op.key()]
+                if d.op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU, Op.FCMPEQ, Op.FCMPGT):
+                    return self.operand(arg_op, depth, sc)
+                if d.op == Op.EXTS and len(d.srcs) == 1:
+                    inner_op = d.srcs[0]
+                    if inner_op.is_var and inner_op.key() in self.defs:
+                        inner_d = self.defs[inner_op.key()]
+                        if inner_d.op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU, Op.FCMPEQ, Op.FCMPGT):
+                            return self.operand(inner_op, depth, sc)
+                    return "(char)%s" % self.operand(inner_op, depth, sc)
             arg = self.operand(insn.srcs[0], depth, sc)
             if not arg.isidentifier() and not (arg.startswith("(") and arg.endswith(")")):
                 arg = "(%s)" % arg
@@ -921,6 +995,21 @@ class CGen(object):
             return text if top else "(%s)" % text
 
         if op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU) and len(insn.srcs) == 2:
+            if op == Op.CMPEQ and insn.srcs[1].is_const and (insn.srcs[1].val >> 96) == 0:
+                cur = insn.srcs[0]
+                while cur.is_var and cur.key() in self.defs:
+                    d = self.defs[cur.key()]
+                    if d.op == Op.EXTS and len(d.srcs) == 1:
+                        cur = d.srcs[0]
+                    else:
+                        break
+                if cur.is_var and cur.key() in self.defs:
+                    cmp_d = self.defs[cur.key()]
+                    if cmp_d.op in (Op.CMPEQ, Op.FCMPEQ) and len(cmp_d.srcs) == 2:
+                        lhs = self.operand(cmp_d.srcs[0], depth, True, want_scalar=True, ew=cmp_d.ew)
+                        rhs = self.operand(cmp_d.srcs[1], depth, True, want_scalar=True, ew=cmp_d.ew)
+                        text = "%s != %s" % (lhs, rhs)
+                        return text if top else "(%s)" % text
             if op in (Op.CMPGT, Op.CMPGTU) and insn.srcs[1].is_const and (insn.srcs[1].val >> 96) in (0xB, 0xF):
                 lhs_op = insn.srcs[0]
                 if lhs_op.is_var and lhs_op.key() in self.defs:
@@ -930,12 +1019,12 @@ class CGen(object):
                         if cmp_op.is_var and cmp_op.key() in self.defs:
                             cmp_insn = self.defs[cmp_op.key()]
                             if cmp_insn.op in (Op.CMPEQ, Op.FCMPEQ) and len(cmp_insn.srcs) == 2:
-                                lhs = self.operand(cmp_insn.srcs[0], depth, True, want_scalar=True)
-                                rhs = self.operand(cmp_insn.srcs[1], depth, True, want_scalar=True)
+                                lhs = self.operand(cmp_insn.srcs[0], depth, True, want_scalar=True, ew=cmp_insn.ew)
+                                rhs = self.operand(cmp_insn.srcs[1], depth, True, want_scalar=True, ew=cmp_insn.ew)
                                 text = "%s == %s" % (lhs, rhs)
                                 return text if top else "(%s)" % text
-            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True)
-            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True, ew=insn.ew)
+            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True, ew=insn.ew)
             sym = "==" if op == Op.CMPEQ else ">"
             text = "%s %s %s" % (lhs, sym, rhs)
             return text if top else "(%s)" % text
@@ -1265,10 +1354,12 @@ class CGen(object):
             return text if top else "(%s)" % text
 
         if insn.ew == EW.H and op in (Op.ADD, Op.SUB, Op.SHL, Op.SHR, Op.SAR) and len(insn.srcs) == 2:
-            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
-            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True, ew=insn.ew)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True, ew=insn.ew)
             sym = {Op.ADD: "+", Op.SUB: "-", Op.SHL: "<<", Op.SHR: ">>", Op.SAR: ">>"}[op]
             cast = "(short)" if op == Op.SAR else "(u16)"
+            if op == Op.ADD and insn.srcs[1].is_const and b.startswith("-"):
+                sym, b = "-", b[1:]
             text = "%s(%s %s %s)" % (cast, a, sym, b)
             return text if top else "(%s)" % text
 
@@ -2122,11 +2213,41 @@ class CGen(object):
 
     def _add_line(self, out, text, primary_ea=None, inlined_eas=None):
         lineno = len(out)
+        if getattr(self, "user_cmts", None):
+            all_check = ([primary_ea] if primary_ea is not None else []) + list(inlined_eas or [])
+            for ea_cand in all_check:
+                cmt = (self.user_cmts.get(hex(ea_cand)) or
+                       self.user_cmts.get(ea_cand) or
+                       self.user_cmts.get(str(ea_cand)))
+                if cmt:
+                    text = f"{text}   // {cmt}"
+                    break
         out.append(text)
         self.body_eas.append(primary_ea)
         all_eas = ([primary_ea] if primary_ea is not None else []) + list(inlined_eas or [])
         unique_eas = list(dict.fromkeys(e for e in all_eas if e is not None))
         self.body_line_to_eas[lineno] = unique_eas
+
+    @staticmethod
+    def _invert_cond_str(cond_str):
+        c = cond_str.strip()
+        if c.startswith("!(") and c.endswith(")"):
+            return c[2:-1].strip()
+        if " == " in c:
+            return c.replace(" == ", " != ", 1)
+        if " != " in c:
+            return c.replace(" != ", " == ", 1)
+        if " <= " in c:
+            return c.replace(" <= ", " > ", 1)
+        if " >= " in c:
+            return c.replace(" >= ", " < ", 1)
+        if " < " in c:
+            return c.replace(" < ", " >= ", 1)
+        if " > " in c:
+            return c.replace(" > ", " <= ", 1)
+        if c.startswith("!"):
+            return c[1:].strip()
+        return f"!({c})"
 
     def emit(self, stmts, out, indent, info):
         pad = "    " * indent
@@ -2142,16 +2263,33 @@ class CGen(object):
                 self._current_inlined_eas = []
                 cond_str = self._cond(st.cond)
                 ea = getattr(st, "ea", None)
-                self._add_line(out, "%sif ( %s )" % (pad, cond_str),
-                               primary_ea=ea, inlined_eas=self._current_inlined_eas)
-                self._add_line(out, pad + "{", primary_ea=None)
-                self.emit(st.then, out, indent + 1, info)
-                self._add_line(out, pad + "}", primary_ea=None)
-                if st.els:
-                    self._add_line(out, pad + "else", primary_ea=None)
+                invert = False
+                if ea is not None and getattr(self, "user_iflags", None):
+                    invert = (ea in self.user_iflags or
+                              hex(ea) in self.user_iflags or
+                              str(ea) in self.user_iflags)
+                if invert and st.els:
+                    cond_str = self._invert_cond_str(cond_str)
+                    self._add_line(out, "%sif ( %s )" % (pad, cond_str),
+                                   primary_ea=ea, inlined_eas=self._current_inlined_eas)
                     self._add_line(out, pad + "{", primary_ea=None)
                     self.emit(st.els, out, indent + 1, info)
                     self._add_line(out, pad + "}", primary_ea=None)
+                    self._add_line(out, pad + "else", primary_ea=None)
+                    self._add_line(out, pad + "{", primary_ea=None)
+                    self.emit(st.then, out, indent + 1, info)
+                    self._add_line(out, pad + "}", primary_ea=None)
+                else:
+                    self._add_line(out, "%sif ( %s )" % (pad, cond_str),
+                                   primary_ea=ea, inlined_eas=self._current_inlined_eas)
+                    self._add_line(out, pad + "{", primary_ea=None)
+                    self.emit(st.then, out, indent + 1, info)
+                    self._add_line(out, pad + "}", primary_ea=None)
+                    if st.els:
+                        self._add_line(out, pad + "else", primary_ea=None)
+                        self._add_line(out, pad + "{", primary_ea=None)
+                        self.emit(st.els, out, indent + 1, info)
+                        self._add_line(out, pad + "}", primary_ea=None)
             elif isinstance(st, Loop):
                 hdr_ea = getattr(st.header, "start_ea", None) if getattr(st, "header", None) else None
                 if st.kind == "while":
@@ -2261,8 +2399,8 @@ class CGen(object):
                                     self._suppressed_call_undefs.add(id(ch_insn))
                                 self._current_inlined_eas.extend(chain_eas)
                                 is_zero = (k in ("z", "hz"))
-                                lhs = self.operand(cmp_insn.srcs[0], 0, True, want_scalar=True)
-                                rhs = self.operand(cmp_insn.srcs[1], 0, True, want_scalar=True)
+                                lhs = self.operand(cmp_insn.srcs[0], 0, True, want_scalar=True, ew=cmp_insn.ew)
+                                rhs = self.operand(cmp_insn.srcs[1], 0, True, want_scalar=True, ew=cmp_insn.ew)
                                 op_sym = "!=" if is_zero else "=="
                                 return "%s %s %s" % (lhs, op_sym, rhs)
 
@@ -2279,8 +2417,8 @@ class CGen(object):
                             self._suppressed_call_undefs.add(id(ch_insn))
                         self._current_inlined_eas.extend(chain_eas)
                         is_zero = (k in ("z", "hz"))
-                        lhs = self.operand(cmp_insn.srcs[0], 0, True, want_scalar=True)
-                        rhs = self.operand(cmp_insn.srcs[1], 0, True, want_scalar=True)
+                        lhs = self.operand(cmp_insn.srcs[0], 0, True, want_scalar=True, ew=cmp_insn.ew)
+                        rhs = self.operand(cmp_insn.srcs[1], 0, True, want_scalar=True, ew=cmp_insn.ew)
                         op_sym = "!=" if is_zero else "=="
                         return "%s %s %s" % (lhs, op_sym, rhs)
 
@@ -2292,8 +2430,8 @@ class CGen(object):
                 for ch_insn in chain_insns:
                     self._suppressed_call_undefs.add(id(ch_insn))
                 is_zero = (k in ("z", "hz"))
-                lhs = self.operand(d.srcs[0], 0, True, want_scalar=True)
-                rhs = self.operand(d.srcs[1], 0, True, want_scalar=True)
+                lhs = self.operand(d.srcs[0], 0, True, want_scalar=True, ew=d.ew)
+                rhs = self.operand(d.srcs[1], 0, True, want_scalar=True, ew=d.ew)
 
                 if d.srcs[1].is_const and (d.srcs[1].val >> 96) == 0:
                     rhs = "0"
@@ -2663,10 +2801,13 @@ def _signature(g, func):
 
 def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
              stk_of=None, this_of=None, sym_of=None,
-             user_renames=None, user_types=None, user_proto=None):
+             user_renames=None, user_types=None, user_proto=None,
+             user_cmts=None, user_iflags=None, user_numforms=None, user_lvars=None):
     """Render the structured AST as pseudocode lines."""
     g = CGen(func, name_of, arity_of, str_of, stk_of, this_of, sym_of,
-             user_renames=user_renames, user_types=user_types, user_proto=user_proto)
+             user_renames=user_renames, user_types=user_types, user_proto=user_proto,
+             user_cmts=user_cmts, user_iflags=user_iflags,
+             user_numforms=user_numforms, user_lvars=user_lvars)
     raw_name = func.name or "sub_%X" % func.start_ea
     if g.user_proto:
         from . import abi

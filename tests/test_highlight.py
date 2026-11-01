@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def _stub():
     il = types.ModuleType("ida_lines")
     il.COLSTR = lambda t, c: "<%s>%s</%s>" % (c, t, c)
-    for n in ("AUTOCMT", "NUMBER", "KEYWORD", "TYPE", "CREFTAIL", "CNAME", "REG", "SYMBOL", "MACRO", "STRING"):
+    for n in ("AUTOCMT", "NUMBER", "KEYWORD", "TYPE", "CREFTAIL", "CNAME", "REG", "SYMBOL", "MACRO", "STRING", "EXTRA"):
         setattr(il, "SCOLOR_" + n, n.lower())
     sys.modules["ida_lines"] = il
 
@@ -26,6 +26,12 @@ def test_highlight():
     assert "<cname>shufb</cname>" in H.colorize("    r7 = shufb(r3, r4, r5);")
     assert "<reg>r5</reg>" in H.colorize("    r5 = r0;")
     assert len(H.colorize_all(["void f(void)", "{", "}"])) == 3
+
+    # Token occurrence highlighting
+    tok_line = "    uint32_t packet_counter = r3 + packet_counter;"
+    hl = H.colorize(tok_line, highlight_ident="packet_counter")
+    assert "<extra>packet_counter</extra>" in hl
+    assert hl.count("<extra>packet_counter</extra>") == 2
     print("ok  test_highlight")
 
 

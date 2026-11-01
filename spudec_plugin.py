@@ -205,6 +205,11 @@ class SpuDecPlugin(ida_idaapi.plugin_t):
         ctx = ida_kernwin.add_hotkey(HOTKEY_ALL, _run_all)
         if ctx is not None:
             _hotkeys.append(ctx)
+        try:
+            from spudec import view
+            view.init_hooks()
+        except Exception:
+            pass
         print("spudec: loaded -- %s = this function, %s = decompile all"
               % (HOTKEY_ONE, HOTKEY_ALL))
         return ida_idaapi.PLUGIN_KEEP
