@@ -280,11 +280,12 @@ class Value(object):
 class Const(Value):
     """A 128-bit constant.  ``val`` is always masked to 128 bits."""
 
-    __slots__ = ("val",)
+    __slots__ = ("val", "ew")
     is_const = True
 
-    def __init__(self, val):
+    def __init__(self, val, ew=None):
         self.val = val & MASK128
+        self.ew = ew
 
     def __eq__(self, other):
         return isinstance(other, Const) and other.val == self.val
@@ -314,8 +315,12 @@ class Const(Value):
         v = self.val
         if v == 0:
             return "#0"
-        for cand in ([ew] if ew is not None and ew != EW.Q else []) + \
-                    [EW.W, EW.H, EW.B, EW.D]:
+        eff_ew = ew or getattr(self, "ew", None)
+        cands = [eff_ew] if eff_ew is not None and eff_ew != EW.Q else []
+        for cand in [EW.B, EW.H, EW.W, EW.D]:
+            if cand not in cands:
+                cands.append(cand)
+        for cand in cands:
             bits = int(cand) * 8
             n = 16 // int(cand)
             lane = v >> (128 - bits)

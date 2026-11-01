@@ -55,14 +55,18 @@ def _tag(text, color):
     return ida_lines.COLSTR(text, color)
 
 
-def colorize(line):
-    """Return ``line`` with IDA colour tags around each token."""
+def colorize(line, highlight_ident=None):
+    """Return ``line`` with IDA colour tags around each token.
+    
+    If ``highlight_ident`` is specified, occurrences of that identifier
+    are given an accent highlight tag (SCOLOR_EXTRA) to emphasize matching tokens.
+    """
     if not line:
         return line
 
     stripped = line.lstrip()
-    # Whole-line comments are the common case; skip the tokenizer.
-    if stripped.startswith("//"):
+    # Whole-line comments are the common case; skip the tokenizer if no token highlight.
+    if stripped.startswith("//") and not highlight_ident:
         return _tag(line, ida_lines.SCOLOR_AUTOCMT)
 
     out = []
@@ -91,7 +95,10 @@ def colorize(line):
         elif kind in ("hex", "num"):
             out.append(_tag(text, ida_lines.SCOLOR_NUMBER))
         elif kind == "ident":
-            out.append(_tag(text, _ident_color(text, line, pos)))
+            if highlight_ident and (text == highlight_ident or text.split(".")[0] == highlight_ident):
+                out.append(_tag(text, ida_lines.SCOLOR_EXTRA))
+            else:
+                out.append(_tag(text, _ident_color(text, line, pos)))
         else:
             out.append(_tag(text, ida_lines.SCOLOR_SYMBOL))
     return "".join(out)

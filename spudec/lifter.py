@@ -153,10 +153,10 @@ class Lifter(object):
         self.blk.add(i)
         return i
 
-    def const(self, val, comment=None):
+    def const(self, val, ew=None, comment=None):
         """Materialise a constant into a fresh temp and return a Var for it."""
         t = self.tmp()
-        self.emit(Op.CONST, t, [Const(val)], comment=comment)
+        self.emit(Op.CONST, t, [Const(val, ew=ew)], ew=ew or EW.W, comment=comment)
         return Var(t)
 
     # -- operand helpers ---------------------------------------------------
@@ -345,7 +345,7 @@ class Lifter(object):
             self.emit(op, insn.Op1.reg, [self.r(insn.Op2)], ew)
         elif name in self.ri10:
             op, ew = self.ri10[name]
-            c = self.const(repl(self.imm(insn.Op3), ew))
+            c = self.const(repl(self.imm(insn.Op3), ew), ew=ew)
             self.emit(op, insn.Op1.reg, [self.r(insn.Op2), c], ew)
         elif name in self.ri7_shift:
             self._shift_imm(insn, *self.ri7_shift[name])

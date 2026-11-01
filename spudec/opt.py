@@ -144,12 +144,12 @@ def propagate(func):
             if d is None or d is insn:
                 continue                       # live-in, or self-reference
             if d.op == Op.CONST:
-                insn.srcs[n] = Const(d.srcs[0].val)
+                insn.srcs[n] = Const(d.srcs[0].val, ew=getattr(d.srcs[0], "ew", None) or getattr(insn, "ew", None))
                 changed = True
             elif d.op == Op.MOV:
                 src = d.srcs[0]
                 if src.is_const:
-                    insn.srcs[n] = Const(src.val)
+                    insn.srcs[n] = Const(src.val, ew=getattr(src, "ew", None) or getattr(insn, "ew", None))
                     changed = True
                 elif src.is_var and src.key() != s.key():
                     insn.srcs[n] = _clone(src)
